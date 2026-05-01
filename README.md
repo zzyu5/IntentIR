@@ -18,8 +18,7 @@ separate translator for every frontend/backend pair.
 
 ![IntentIR frontend/backend interface](docs/assets/fig1_cropped.png)
 
-The figure above, copied from the IntentIR paper assets
-([PDF version](docs/assets/fig1_cropped.pdf)), shows the central interface:
+The figure above shows the central interface:
 without a common IR, `N` kernel frontends and `M` target backends create an
 `N x M` translation problem. IntentIR reduces that to `N` frontend lifters plus
 `M` backend consumers over one shared semantic artifact.
@@ -48,10 +47,10 @@ the rest of the TianChen compilation stack.
 
 ## Core Idea
 
-The paper frames IntentIR as the inverse of ordinary lowering. Instead of
-starting with a clean tensor program and lowering it to a specialized kernel,
-IntentIR starts from a schedule-specialized implementation and recovers a
-portable, executable, checkable intent artifact.
+Conceptually, IntentIR is the inverse of ordinary lowering. Instead of starting
+with a clean tensor program and lowering it to a specialized kernel, IntentIR
+starts from a schedule-specialized implementation and recovers a portable,
+executable, checkable intent artifact.
 
 The recovered representation has three layers:
 
@@ -104,11 +103,11 @@ collection of generated artifacts.
   verification, MLIR tooling, backend smoke checks, and provider matrix runs.
 - `tests/`: curated fast tests for the semantic core, MLIR/backend lowering,
   provider boundaries, and pipeline behavior.
-- `docs/assets/`: the single paper figure asset referenced by this README.
+- `docs/assets/`: the design figure asset referenced by this README.
 
 This cleaned repository intentionally does not include historical archives,
-paper source, workflow state, generated experiment outputs, local toolchains,
-Triton dumps, or Python bytecode caches.
+manuscript source, workflow state, generated experiment outputs, local
+toolchains, Triton dumps, or Python bytecode caches.
 
 ## Quickstart
 
@@ -164,8 +163,8 @@ The repository is reproducible at two levels:
   and parameterized through scripts.
 
 The important rule is that checked-in source is the source of truth. Outputs,
-workflow snapshots, paper tables, compiled kernels, and caches are not required
-to understand or rebuild the project.
+workflow snapshots, manuscript tables, compiled kernels, and caches are not
+required to understand or rebuild the project.
 
 ## Development Notes
 
