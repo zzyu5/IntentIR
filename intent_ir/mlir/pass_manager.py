@@ -1,0 +1,689 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import shlex
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .module import IntentMLIRModule
+from .passes import PASS_REGISTRY
+from .toolchain import detect_mlir_toolchain
+from .convert_to_intent import to_intent
+
+ROOT = Path(__file__).resolve().parents[2]
+PIPELINES_DIR = Path(__file__).resolve().parent / "pipelines"
+_INTENTIR_PLUGIN_PASS_FALLBACKS = {
+    "intentir-apply-tuning-db-cuda-v1": "apply_tuning_db",
+    "intentir-lower-cuda-focus-v1": "lower_intent_to_cuda_gpu_kernel",
+    "intentir-extract-gpu-module-llvm-v1": "extract_gpu_module_llvm",
+}
+
+
+@dataclass
+class PassRecord:
+    name: str
+    kind: str
+    ok: bool
+    ms: float
+    detail: str
+    before_path: str = ""
+    after_path: str = ""
+    before_stats: dict[str, Any] | None = None
+    after_stats: dict[str, Any] | None = None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "ok": bool(self.ok),
+            "ms": float(self.ms),
+            "detail": str(self.detail),
+            "before_path": str(self.before_path),
+            "after_path": str(self.after_path),
+            "before_stats": dict(self.before_stats or {}),
+            "after_stats": dict(self.after_stats or {}),
+        }
+
+
+@dataclass
+class PassExecutionResult:
+    module: IntentMLIRModule
+    kind: str
+    detail: str
+
+
+def run_pipeline(
+    module: IntentMLIRModule,
+    pipeline_name: str,
+    *,
+    backend: str | None = None,
+    out_dir: Path | None = None,
+    fail_on_error: bool = False,
+) -> tuple[IntentMLIRModule, dict[str, Any]]:
+    pipeline_spec = _load_pipeline_spec(str(pipeline_name), backend=backend)
+    trace: list[PassRecord] = []
+    current = module
+    toolchain = detect_mlir_toolchain()
+
+    out = Path(out_dir) if out_dir is not None else None
+    if out is not None:
+        out.mkdir(parents=True, exist_ok=True)
+
+    for idx, pass_name in enumerate(list(pipeline_spec.get("passes") or [])):
+        t0 = time.perf_counter()
+        before_path = ""
+        after_path = ""
+        before_stats = _module_stats(current)
+        try:
+            if out is not None:
+                before_path = str(out / f"pass_{idx:03d}_{_safe(pass_name)}.before.mlir")
+                Path(before_path).write_text(current.module_text, encoding="utf-8")
+            exec_result = _run_one_pass(current, pass_name, backend=backend, toolchain=toolchain)
+            current = exec_result.module
+            after_stats = _module_stats(current)
+            if out is not None:
+                after_path = str(out / f"pass_{idx:03d}_{_safe(pass_name)}.after.mlir")
+                Path(after_path).write_text(current.module_text, encoding="utf-8")
+            dt = float((time.perf_counter() - t0) * 1000.0)
+            trace.append(
+                PassRecord(
+                    name=str(pass_name),
+                    kind=str(exec_result.kind),
+                    ok=True,
+                    ms=dt,
+                    detail=str(exec_result.detail),
+                    before_path=before_path,
+                    after_path=after_path,
+                    before_stats=before_stats,
+                    after_stats=after_stats,
+                )
+            )
+        except Exception as e:
+            dt = float((time.perf_counter() - t0) * 1000.0)
+            after_stats = _module_stats(current)
+            trace.append(
+                PassRecord(
+                    name=str(pass_name),
+                    kind=_pass_kind(str(pass_name)),
+                    ok=False,
+                    ms=dt,
+                    detail=f"{type(e).__name__}: {e}",
+                    before_path=before_path,
+                    after_path=after_path,
+                    before_stats=before_stats,
+                    after_stats=after_stats,
+                )
+            )
+            if fail_on_error:
+                raise
+            break
+
+    payload = {
+        "schema_version": "intent_mlir_pass_trace_v1",
+        "pipeline": str(pipeline_name),
+        "backend": (str(backend) if backend else None),
+        "toolchain": toolchain,
+        "passes": [x.to_json_dict() for x in trace],
+        "ok": bool(all(x.ok for x in trace)),
+        "input_stats": _module_stats(module),
+        "output_stats": _module_stats(current),
+    }
+    if out is not None:
+        trace_path = out / "pass_trace.json"
+        trace_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        payload["pass_trace_path"] = str(trace_path)
+    return current, payload
+
+
+def _run_one_pass(
+    module: IntentMLIRModule,
+    pass_name: str,
+    *,
+    backend: str | None,
+    toolchain: dict[str, Any],
+) -> PassExecutionResult:
+    name = str(pass_name).strip()
+    if not name:
+        return PassExecutionResult(module=module, kind="python", detail="skipped_empty")
+    if name.startswith("python:"):
+        key = name.split(":", 1)[1].strip()
+        fn = PASS_REGISTRY.get(key)
+        if fn is None:
+            raise ValueError(f"unknown python pass: {key}")
+        return PassExecutionResult(module=fn(module, backend=backend), kind="python", detail="ok")
+    if name.startswith("mlir-opt?:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        fallback = _maybe_intentir_mlir_opt_python_fallback(module, pass_arg=pass_arg, backend=backend)
+        if fallback is not None:
+            return fallback
+        tool = _tool_path(toolchain, "mlir-opt")
+        if not tool:
+            return PassExecutionResult(
+                module=module,
+                kind="mlir-opt",
+                detail="skipped_optional_tool_unavailable:mlir-opt",
+            )
+        try:
+            return PassExecutionResult(
+                module=_run_mlir_opt_pass(module, pass_arg=pass_arg, tool=tool),
+                kind="mlir-opt",
+                detail="ok",
+            )
+        except Exception as e:
+            return PassExecutionResult(
+                module=module,
+                kind="mlir-opt",
+                detail=f"skipped_optional_pass_failed:mlir-opt:{type(e).__name__}:{e}",
+            )
+    if name.startswith("mlir-opt:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        fallback = _maybe_intentir_mlir_opt_python_fallback(module, pass_arg=pass_arg, backend=backend)
+        if fallback is not None:
+            return fallback
+        tool = _tool_path(toolchain, "mlir-opt")
+        if not tool:
+            raise RuntimeError("mlir-opt unavailable")
+        return PassExecutionResult(
+            module=_run_mlir_opt_pass(module, pass_arg=pass_arg, tool=tool),
+            kind="mlir-opt",
+            detail="ok",
+        )
+    if name.startswith("mlir-translate?:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        tool = _tool_path(toolchain, "mlir-translate")
+        if not tool:
+            return PassExecutionResult(
+                module=module,
+                kind="mlir-translate",
+                detail="skipped_optional_tool_unavailable:mlir-translate",
+            )
+        try:
+            return PassExecutionResult(
+                module=_run_mlir_translate_pass(module, pass_arg=pass_arg, tool=tool),
+                kind="mlir-translate",
+                detail="ok",
+            )
+        except Exception as e:
+            return PassExecutionResult(
+                module=module,
+                kind="mlir-translate",
+                detail=f"skipped_optional_pass_failed:mlir-translate:{type(e).__name__}:{e}",
+            )
+    if name.startswith("mlir-translate:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        tool = _tool_path(toolchain, "mlir-translate")
+        if not tool:
+            raise RuntimeError("mlir-translate unavailable")
+        return PassExecutionResult(
+            module=_run_mlir_translate_pass(module, pass_arg=pass_arg, tool=tool),
+            kind="mlir-translate",
+            detail="ok",
+        )
+    if name.startswith("llvm-as?:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        tool = _tool_path(toolchain, "llvm-as")
+        if not tool:
+            return PassExecutionResult(
+                module=module,
+                kind="llvm-as",
+                detail="skipped_optional_tool_unavailable:llvm-as",
+            )
+        try:
+            return PassExecutionResult(
+                module=_run_llvm_as_pass(module, pass_arg=pass_arg, tool=tool),
+                kind="llvm-as",
+                detail="ok",
+            )
+        except Exception as e:
+            return PassExecutionResult(
+                module=module,
+                kind="llvm-as",
+                detail=f"skipped_optional_pass_failed:llvm-as:{type(e).__name__}:{e}",
+            )
+    if name.startswith("llvm-as:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        tool = _tool_path(toolchain, "llvm-as")
+        if not tool:
+            raise RuntimeError("llvm-as unavailable")
+        return PassExecutionResult(
+            module=_run_llvm_as_pass(module, pass_arg=pass_arg, tool=tool),
+            kind="llvm-as",
+            detail="ok",
+        )
+    if name.startswith("opt?:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        tool = _tool_path(toolchain, "opt")
+        if not tool:
+            return PassExecutionResult(
+                module=module,
+                kind="opt",
+                detail="skipped_optional_tool_unavailable:opt",
+            )
+        try:
+            return PassExecutionResult(
+                module=_run_llvm_opt_pass(module, pass_arg=pass_arg, tool=tool),
+                kind="opt",
+                detail="ok",
+            )
+        except Exception as e:
+            return PassExecutionResult(
+                module=module,
+                kind="opt",
+                detail=f"skipped_optional_pass_failed:opt:{type(e).__name__}:{e}",
+            )
+    if name.startswith("opt:"):
+        pass_arg = name.split(":", 1)[1].strip()
+        tool = _tool_path(toolchain, "opt")
+        if not tool:
+            raise RuntimeError("opt unavailable")
+        return PassExecutionResult(
+            module=_run_llvm_opt_pass(module, pass_arg=pass_arg, tool=tool),
+            kind="opt",
+            detail="ok",
+        )
+    raise ValueError(f"unsupported pass selector: {name}")
+
+
+def _tool_path(toolchain: dict[str, Any], name: str) -> str:
+    return str((((toolchain.get("tools") or {}).get(name) or {}).get("path") or "")).strip()
+
+def _maybe_autoset_intentir_cuda_sm(*, pass_arg: str) -> None:
+    """
+    Best-effort quality-of-life: many C++ plugin passes (notably
+    `intentir-apply-tuning-db-cuda-v1`) key off `INTENTIR_CUDA_SM` to enable
+    arch-scoped tuning_db entries (including kernel_kind overrides).
+
+    In local CUDA runs we can infer the SM from torch and set the env var if the
+    user didn't specify it. This helps avoid silently compiling focus kernels
+    with slower default variants.
+    """
+
+    if str(os.getenv("INTENTIR_CUDA_SM", "")).strip():
+        return
+    if "intentir-apply-tuning-db-cuda-v1" not in str(pass_arg or ""):
+        return
+    try:  # pragma: no cover - depends on CUDA env
+        import torch  # type: ignore
+
+        if not torch.cuda.is_available():
+            return
+        major, minor = torch.cuda.get_device_capability(0)
+        if isinstance(major, int) and isinstance(minor, int) and major > 0 and minor >= 0:
+            os.environ["INTENTIR_CUDA_SM"] = f"sm_{int(major)}{int(minor)}"
+    except Exception:
+        return
+
+
+def _extract_intentir_plugin_passes(pass_arg: str) -> list[str]:
+    text = str(pass_arg or "").strip()
+    if not text:
+        return []
+    names = re.findall(r"(intentir-[a-z0-9-]+-v[0-9]+)", text)
+    return [str(x) for x in names if str(x).strip()]
+
+
+def _resolve_intentir_mlir_pass_plugin() -> str:
+    plugin_env = str(os.getenv("INTENTIR_MLIR_PASS_PLUGIN", "")).strip()
+    if plugin_env.lower() in {"0", "off", "false", "disable", "disabled"}:
+        return ""
+    if plugin_env:
+        return plugin_env
+    auto_env = str(os.getenv("INTENTIR_AUTO_MLIR_PASS_PLUGIN", "")).strip().lower()
+    if auto_env in {"0", "off", "false", "disable", "disabled"}:
+        return ""
+    default_plugin = ROOT / "artifacts" / "mlir_plugins" / "intentir" / "libIntentIRPasses.so"
+    return str(default_plugin) if default_plugin.is_file() else ""
+
+
+def _maybe_intentir_mlir_opt_python_fallback(
+    module: IntentMLIRModule,
+    *,
+    pass_arg: str,
+    backend: str | None,
+) -> PassExecutionResult | None:
+    plugin = _resolve_intentir_mlir_pass_plugin()
+    if plugin:
+        return None
+    intentir_passes = _extract_intentir_plugin_passes(pass_arg)
+    if not intentir_passes:
+        return None
+    python_passes: list[str] = []
+    for plugin_pass in intentir_passes:
+        key = _INTENTIR_PLUGIN_PASS_FALLBACKS.get(str(plugin_pass))
+        if not key:
+            return None
+        python_passes.append(str(key))
+    current = module
+    applied: list[str] = []
+    for key in python_passes:
+        fn = PASS_REGISTRY.get(str(key))
+        if fn is None:
+            raise RuntimeError(f"missing python fallback for {key}")
+        current = fn(current, backend=backend)
+        current.meta = dict(current.meta or {})
+        current.meta.setdefault("intentir_mlir_opt_fallback_passes", [])
+        current.meta["intentir_mlir_opt_fallback_passes"] = [
+            *list(current.meta.get("intentir_mlir_opt_fallback_passes") or []),
+            str(key),
+        ]
+        applied.append(str(key))
+    return PassExecutionResult(
+        module=current,
+        kind="python",
+        detail=f"python_fallback:intentir_mlir_plugin_unavailable:{','.join(applied)}",
+    )
+
+
+def _run_mlir_opt_pass(module: IntentMLIRModule, *, pass_arg: str, tool: str) -> IntentMLIRModule:
+    arg_tokens = [x for x in shlex.split(str(pass_arg or "").strip()) if str(x).strip()]
+    if not arg_tokens:
+        raise RuntimeError("mlir-opt pass selector missing pass argument")
+    cli_args = [x if str(x).startswith("-") else f"--{x}" for x in arg_tokens]
+    _maybe_autoset_intentir_cuda_sm(pass_arg=str(pass_arg or ""))
+    plugin = _resolve_intentir_mlir_pass_plugin()
+    plugin_arg: list[str] = []
+    if plugin:
+        if not Path(plugin).is_file():
+            raise RuntimeError(f"INTENTIR_MLIR_PASS_PLUGIN points to missing file: {plugin}")
+        plugin_arg = [f"-load-pass-plugin={plugin}"]
+    p = subprocess.run(
+        [tool, *plugin_arg, *cli_args],
+        input=str(module.module_text),
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"mlir-opt failed ({' '.join(cli_args)}): {p.stderr or p.stdout}")
+    out = IntentMLIRModule(
+        module_text=str(p.stdout or ""),
+        dialect_version=str(module.dialect_version),
+        provenance=dict(module.provenance or {}),
+        symbols=list(module.symbols or []),
+        meta=dict(module.meta or {}),
+        intent_json=(dict(module.intent_json) if isinstance(module.intent_json, dict) else None),
+    )
+    out.meta["last_mlir_opt_pass"] = str(pass_arg)
+    try:
+        harvested = _harvest_intentir_module_attrs(str(out.module_text or ""))
+        if harvested:
+            out.meta.update(dict(harvested))
+    except Exception:
+        # Best-effort only: attribute harvesting must never break compilation.
+        pass
+    return out
+
+
+def _run_mlir_translate_pass(module: IntentMLIRModule, *, pass_arg: str, tool: str) -> IntentMLIRModule:
+    arg_tokens = [x for x in shlex.split(str(pass_arg or "").strip()) if str(x).strip()]
+    if not arg_tokens:
+        raise RuntimeError("mlir-translate selector missing argument")
+    cli_args = [x if str(x).startswith("-") else f"--{x}" for x in arg_tokens]
+    p = subprocess.run(
+        [tool, *cli_args],
+        input=str(module.module_text),
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"mlir-translate failed ({' '.join(cli_args)}): {p.stderr or p.stdout}")
+    out = IntentMLIRModule(
+        module_text=str(p.stdout or ""),
+        dialect_version=str(module.dialect_version),
+        provenance=dict(module.provenance or {}),
+        symbols=list(module.symbols or []),
+        meta=dict(module.meta or {}),
+        intent_json=(dict(module.intent_json) if isinstance(module.intent_json, dict) else None),
+    )
+    out.meta["last_mlir_translate"] = str(pass_arg)
+    # When mlir-translate produces textual LLVM IR, annotate provenance so
+    # downstream contracts can distinguish "real translate" from cached IR.
+    if str(pass_arg or "").strip().lower().replace("-", "_") in {
+        "mlir_to_llvmir",
+        "--mlir_to_llvmir",
+        "mlir_to_llvmir",  # defensive duplicates
+    } or "mlir-to-llvmir" in str(pass_arg or ""):
+        out.meta.setdefault("llvm_text_origin", "mlir_translate")
+        out.meta.setdefault("llvm_dialect_origin", "mlir_translate")
+    return out
+
+
+def _run_llvm_as_pass(module: IntentMLIRModule, *, pass_arg: str, tool: str) -> IntentMLIRModule:
+    arg_tokens = [x for x in shlex.split(str(pass_arg or "").strip()) if str(x).strip()]
+    with tempfile.TemporaryDirectory(prefix="intentir_llvm_as_") as td:
+        in_path = Path(td) / "input.ll"
+        out_path = Path(td) / "output.bc"
+        in_path.write_text(str(module.module_text or ""), encoding="utf-8")
+        p = subprocess.run(
+            [tool, str(in_path), *arg_tokens, "-o", str(out_path)],
+            capture_output=True,
+            text=True,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(f"llvm-as failed: {p.stderr or p.stdout}")
+        if not out_path.is_file():
+            raise RuntimeError("llvm-as did not produce output bitcode")
+    out = IntentMLIRModule(
+        module_text=str(module.module_text or ""),
+        dialect_version=str(module.dialect_version),
+        provenance=dict(module.provenance or {}),
+        symbols=list(module.symbols or []),
+        meta=dict(module.meta or {}),
+        intent_json=(dict(module.intent_json) if isinstance(module.intent_json, dict) else None),
+    )
+    out.meta["last_llvm_as"] = str(pass_arg)
+    return out
+
+
+def _run_llvm_opt_pass(module: IntentMLIRModule, *, pass_arg: str, tool: str) -> IntentMLIRModule:
+    arg_tokens = [x for x in shlex.split(str(pass_arg or "").strip()) if str(x).strip()]
+    # Keep output textual so the resulting module can be archived as `.ll`.
+    if "-S" not in arg_tokens:
+        arg_tokens = ["-S", *arg_tokens]
+    # Avoid redirecting output away from stdout.
+    scrubbed: list[str] = []
+    skip_next = False
+    for tok in arg_tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in {"-o", "--output"}:
+            skip_next = True
+            continue
+        scrubbed.append(tok)
+    p = subprocess.run(
+        [tool, *scrubbed],
+        input=str(module.module_text or ""),
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"opt failed ({' '.join(scrubbed)}): {p.stderr or p.stdout}")
+    out_text = str(p.stdout or "").strip()
+    if not out_text:
+        raise RuntimeError("opt produced empty textual output")
+    out = IntentMLIRModule(
+        module_text=str(p.stdout or ""),
+        dialect_version=str(module.dialect_version),
+        provenance=dict(module.provenance or {}),
+        symbols=list(module.symbols or []),
+        meta=dict(module.meta or {}),
+        intent_json=(dict(module.intent_json) if isinstance(module.intent_json, dict) else None),
+    )
+    out.meta["last_llvm_opt"] = str(pass_arg)
+    return out
+
+
+def _load_pipeline_spec(name: str, *, backend: str | None = None) -> dict[str, Any]:
+    base = str(name or "").strip()
+    if not base:
+        raise ValueError("pipeline name is empty")
+    filename = base if base.endswith(".yaml") else f"{base}.yaml"
+    path = PIPELINES_DIR / filename
+    if backend and base.startswith("downstream") and not path.exists():
+        path = PIPELINES_DIR / f"downstream_{backend}.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"pipeline spec not found: {path}")
+    raw = path.read_text(encoding="utf-8")
+    passes = _parse_yaml_pass_list(raw)
+    return {"name": base, "path": str(path), "passes": passes}
+
+
+def _parse_yaml_pass_list(text: str) -> list[str]:
+    try:
+        import yaml  # type: ignore
+
+        payload = yaml.safe_load(text)
+        if isinstance(payload, dict):
+            rows = payload.get("passes")
+            if isinstance(rows, list):
+                return [str(x).strip() for x in rows if str(x).strip()]
+    except Exception:
+        pass
+    out: list[str] = []
+    for line in str(text).splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("-"):
+            item = s[1:].strip()
+            if item:
+                out.append(item)
+    return out
+
+
+def _safe(name: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(name))
+    # Keep filenames bounded for long pass strings (e.g. large mlir-opt pipelines).
+    # We preserve prefix for readability and include a stable-ish suffix hash.
+    if len(safe) <= 80:
+        return safe
+    import hashlib  # local import to keep module load small
+
+    h = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:10]
+    return f"{safe[:60]}__{h}"
+
+
+def _module_stats(module: IntentMLIRModule) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "symbols": int(len(list(module.symbols or []))),
+        "dialect_version": str(module.dialect_version),
+    }
+    try:
+        intent = to_intent(module)
+        stats.update(
+            {
+                "intent_name": str(intent.name),
+                "ops": int(len(list(intent.ops or []))),
+                "tensors": int(len(dict(intent.tensors or {}))),
+                "outputs": int(len(list(intent.outputs or []))),
+            }
+        )
+    except Exception as e:
+        stats["intent_decode_error"] = f"{type(e).__name__}: {e}"
+    return stats
+
+
+def _pass_kind(pass_name: str) -> str:
+    name = str(pass_name).strip()
+    if name.startswith("mlir-opt"):
+        return "mlir-opt"
+    if name.startswith("mlir-translate"):
+        return "mlir-translate"
+    if name.startswith("llvm-as"):
+        return "llvm-as"
+    if name.startswith("opt"):
+        return "opt"
+    return "python"
+
+
+_INTENTIR_STR_ATTR_RE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _extract_mlir_string_attr(module_text: str, attr_key: str) -> str | None:
+    key = str(attr_key or "").strip()
+    if not key:
+        return None
+    pat = _INTENTIR_STR_ATTR_RE_CACHE.get(key)
+    if pat is None:
+        pat = re.compile(rf"{re.escape(key)}\s*=\s*\"([^\"]*)\"")
+        _INTENTIR_STR_ATTR_RE_CACHE[key] = pat
+    m = pat.search(str(module_text or ""))
+    if not m:
+        return None
+    return str(m.group(1) or "")
+
+
+def _decode_intentir_b64_json_obj(b64: str) -> dict[str, Any] | None:
+    raw = str(b64 or "").strip()
+    if not raw:
+        return None
+    try:
+        decoded = base64.b64decode(raw.encode("ascii"), validate=True).decode("utf-8")
+        payload = json.loads(decoded)
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return dict(payload)
+    return None
+
+
+def _harvest_intentir_module_attrs(module_text: str) -> dict[str, Any]:
+    """
+    Best-effort extraction of `intentir.*` carrier module attributes into
+    IntentMLIRModule.meta so downstream contracts / perf reports don't need
+    Python-side re-derivation for cpp_plugin flows.
+    """
+
+    text = str(module_text or "")
+    # Only attempt to harvest from MLIR. Downstream stages may contain LLVM IR.
+    if not text.lstrip().startswith("module"):
+        return {}
+
+    out: dict[str, Any] = {}
+
+    # Common audit attrs (string).
+    compiler_stack = _extract_mlir_string_attr(text, "intentir.compiler_stack")
+    if compiler_stack:
+        out["compiler_stack"] = str(compiler_stack)
+    lowering_kind = _extract_mlir_string_attr(text, "intentir.lowering_kind")
+    if lowering_kind:
+        out["lowering_kind"] = str(lowering_kind)
+    cuda_kind = _extract_mlir_string_attr(text, "intentir.cuda_real_mlir_kernel_kind")
+    if cuda_kind:
+        out["cuda_real_mlir_kernel_kind"] = str(cuda_kind)
+    kk = _extract_mlir_string_attr(text, "intentir.kernel_kind_override")
+    if kk:
+        out["intentir_kernel_kind_override"] = str(kk)
+
+    # Shape bindings (b64 json) are needed for both lowering and audit.
+    sb_b64 = _extract_mlir_string_attr(text, "intentir.shape_bindings_b64")
+    sb = _decode_intentir_b64_json_obj(sb_b64 or "") if sb_b64 else None
+    if isinstance(sb, dict) and sb:
+        normalized: dict[str, int] = {}
+        for k, v in dict(sb).items():
+            key = str(k).strip()
+            if not key:
+                continue
+            try:
+                normalized[key] = int(v)
+            except Exception:
+                continue
+        if normalized:
+            out["shape_bindings"] = dict(normalized)
+
+    # C++ plugin can emit a compact JSON-b64 meta carrier for launch/tuning/etc.
+    meta_b64 = _extract_mlir_string_attr(text, "intentir.meta_json_b64")
+    meta = _decode_intentir_b64_json_obj(meta_b64 or "") if meta_b64 else None
+    if isinstance(meta, dict) and meta:
+        # Do not let schema markers pollute downstream contract artifacts.
+        meta.pop("schema_version", None)
+        out.update(dict(meta))
+
+    return out

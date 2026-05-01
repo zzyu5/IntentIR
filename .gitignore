@@ -1,0 +1,55 @@
+# Local secrets
+intent_ir/llm_providers.local.json
+.env
+.env.*
+
+# Generated outputs
+artifacts/
+$OUT/
+workflow/
+archive/
+experiment/
+paper/
+papers/
+slides/
+private_doc/
+private_docs/
+docs/private/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Native/build outputs
+*.o
+*.so
+*.a
+*.dylib
+*.bc
+*.ll
+*.ptx
+*.cubin
+*.elf
+backends/spmd_rvv/cpp_codegen/build/
+backends/cuda/cpp_codegen/build/
+artifacts/toolchains/
+
+# Generated kernel snapshots
+kernels/cuda/ops/snapshots/
+kernels/cuda/ops/tilelang_generated/
+
+# Editors and local logs
+.vscode/
+.idea/
+*.log
+autotuner.log

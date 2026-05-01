@@ -1,0 +1,1268 @@
+"""
+Run FlagGems end-to-end matrix and converge registry status.
+
+Stages:
+1) Triton provider pipeline (flaggems)
+2) RVV local backend smoke
+3) CUDA local backend smoke
+4) Status convergence report
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from intent_ir.utils.repo_state import repo_state  # noqa: E402
+
+
+def _env_flag(name: str) -> bool:
+    raw = str(os.getenv(str(name), "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _run(cmd: list[str], *, cwd: Path, stream_output: bool = False) -> tuple[int, str, str]:
+    if not bool(stream_output):
+        p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+        return int(p.returncode), str(p.stdout or ""), str(p.stderr or "")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    merged: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        merged.append(line)
+        print(line, end="", flush=True)
+    rc = int(proc.wait())
+    return rc, "".join(merged), ""
+
+
+def _run_with_timeout(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    stream_output: bool = False,
+    timeout_sec: int | None = None,
+) -> tuple[int, str, str, bool]:
+    timeout = None
+    if timeout_sec is not None and int(timeout_sec) > 0:
+        timeout = int(timeout_sec)
+    if timeout is None:
+        rc, out, err = _run(cmd, cwd=cwd, stream_output=stream_output)
+        return rc, out, err, False
+
+    try:
+        if bool(stream_output):
+            # Timeout-aware mode uses subprocess.run so we can enforce deadline.
+            # Keep output visible by replaying captured streams.
+            p = subprocess.run(
+                cmd,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            out = str(p.stdout or "")
+            err = str(p.stderr or "")
+            if out:
+                print(out, end="", flush=True)
+            if err:
+                print(err, end="", file=sys.stderr, flush=True)
+            return int(p.returncode), out, err, False
+
+        p = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return int(p.returncode), str(p.stdout or ""), str(p.stderr or ""), False
+    except subprocess.TimeoutExpired as e:
+        out = str(e.stdout or "")
+        err = str(e.stderr or "")
+        timeout_msg = f"stage timeout after {timeout}s"
+        if out:
+            print(out, end="", flush=True)
+        print(f"[matrix] {timeout_msg}: {' '.join(str(x) for x in cmd)}", file=sys.stderr, flush=True)
+        if err:
+            print(err, end="", file=sys.stderr, flush=True)
+        if err:
+            err = f"{err.rstrip()}\n{timeout_msg}\n"
+        else:
+            err = f"{timeout_msg}\n"
+        return 124, out, err, True
+
+
+def _with_env_prefix(cmd: list[str], env_map: dict[str, str] | None) -> list[str]:
+    if not env_map:
+        return list(cmd)
+    pairs = [f"{k}={v}" for k, v in sorted(env_map.items()) if str(k).strip() and str(v).strip()]
+    if not pairs:
+        return list(cmd)
+    return ["env", *pairs, *list(cmd)]
+
+
+def _execution_ir_mode() -> str:
+    mode = str(os.getenv("INTENTIR_EXECUTION_IR", "mlir")).strip().lower()
+    if mode and mode != "mlir":
+        print(
+            f"[matrix] ignore INTENTIR_EXECUTION_IR={mode!r}; MLIR-only execution path is enforced",
+            file=sys.stderr,
+            flush=True,
+        )
+    return "mlir"
+
+
+def _parse_shape_overrides(raw: list[str] | None) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for item in list(raw or []):
+        text = str(item).strip()
+        if not text:
+            continue
+        if "=" not in text:
+            raise SystemExit(f"--shape expects KEY=INT, got: {text!r}")
+        key, value = text.split("=", 1)
+        key = str(key).strip()
+        value = str(value).strip()
+        if not key or not value:
+            raise SystemExit(f"--shape expects KEY=INT, got: {text!r}")
+        try:
+            out[key] = int(value)
+        except Exception as e:
+            raise SystemExit(f"--shape expects KEY=INT, got: {text!r} ({type(e).__name__}: {e})") from e
+    return out
+
+
+def _load_active_semantic_ops(active_batch_path: Path) -> list[str]:
+    if not active_batch_path.is_file():
+        return []
+    try:
+        payload = json.loads(active_batch_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    out: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        op = str(it.get("semantic_op") or "").strip()
+        if op and op not in out:
+            out.append(op)
+    return out
+
+
+def _suite_kernel_names(*, suite: str, flaggems_opset: str, backend_target: str) -> list[str]:
+    if str(suite) == "smoke":
+        from pipeline.triton.providers.flaggems.specs import default_flaggems_kernel_specs  # noqa: PLC0415
+
+        specs = default_flaggems_kernel_specs(
+            flaggems_opset=str(flaggems_opset),
+            backend_target=str(backend_target),
+        )
+    else:
+        from pipeline.triton.providers.flaggems.specs import coverage_flaggems_kernel_specs  # noqa: PLC0415
+
+        specs = coverage_flaggems_kernel_specs(
+            flaggems_opset=str(flaggems_opset),
+            backend_target=str(backend_target),
+        )
+    return [str(s.name) for s in specs]
+
+
+def _collect_missing_provider_reports(provider_report_dir: Path, kernels: list[str]) -> list[str]:
+    missing: list[str] = []
+    for kernel in kernels:
+        report_path = provider_report_dir / f"{kernel}.json"
+        if not report_path.is_file():
+            missing.append(str(kernel))
+    return missing
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _count_status_entries(entries: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in list(entries):
+        status = str(row.get("status") or "unknown").strip() or "unknown"
+        counts[status] = int(counts.get(status, 0)) + 1
+    return dict(sorted(counts.items(), key=lambda kv: kv[0]))
+
+
+def _project_status_converged_to_scope(
+    *,
+    status_converged_path: Path,
+) -> bool:
+    """For scoped matrix runs, project primary counters to scoped entries only.
+
+    converge_status.py always emits full-registry `counts_global`. For explicit
+    kernel subset runs, that inflates blocked_backend/provider-missing noise.
+    This projection keeps scoped entries as the canonical counters while
+    preserving original registry counters for auditability.
+    """
+
+    payload = _load_json(status_converged_path)
+    if not payload:
+        return False
+    if not bool(payload.get("scope_enabled")):
+        return False
+    scoped_entries = [e for e in list(payload.get("scoped_entries") or []) if isinstance(e, dict)]
+    if not scoped_entries:
+        return False
+
+    original_counts = dict(payload.get("counts_global") or {})
+    original_count_total = int(payload.get("global_entries_count") or 0)
+    original_fallback_count = int(payload.get("runtime_fallback_kernel_count") or 0)
+    original_fallback_kernels = list(payload.get("runtime_fallback_kernels") or [])
+
+    projected_counts = _count_status_entries(scoped_entries)
+    projected_total = int(len(scoped_entries))
+    projected_determinability_ok = int(sum(1 for e in scoped_entries if bool(e.get("determinability"))))
+    projected_artifact_complete = int(sum(1 for e in scoped_entries if bool(e.get("artifact_complete"))))
+    projected_fallback_kernels = sorted(
+        {
+            str(e.get("e2e_spec") or e.get("semantic_op") or "unknown")
+            for e in scoped_entries
+            if bool(e.get("runtime_fallback"))
+        }
+    )
+    projected_fallback_count = int(len(projected_fallback_kernels))
+
+    payload["registry_counts_global"] = original_counts
+    payload["registry_entries_count"] = original_count_total
+    payload["registry_runtime_fallback_kernel_count"] = original_fallback_count
+    payload["registry_runtime_fallback_kernels"] = original_fallback_kernels
+    payload["scope_projection_applied"] = True
+    payload["scope_projection_source"] = "scoped_entries"
+
+    payload["entries"] = scoped_entries
+    payload["counts_by_status"] = projected_counts
+    payload["counts_global"] = projected_counts
+    payload["global_entries_count"] = projected_total
+    payload["determinability_ok_count"] = projected_determinability_ok
+    payload["artifact_complete_count"] = projected_artifact_complete
+    payload["determinability_ratio"] = (
+        float(projected_determinability_ok) / float(projected_total) if projected_total else 0.0
+    )
+    payload["artifact_complete_ratio"] = (
+        float(projected_artifact_complete) / float(projected_total) if projected_total else 0.0
+    )
+    payload["runtime_fallback_kernel_count"] = projected_fallback_count
+    payload["runtime_fallback_kernels"] = projected_fallback_kernels
+
+    status_converged_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return True
+
+
+def _resolve_report_path(path_raw: str, *, default_dir: Path) -> Path:
+    p = Path(str(path_raw).strip())
+    if not p.is_absolute():
+        p = default_dir / p
+    return p
+
+
+def _collect_mlir_llvm_artifacts(
+    *,
+    provider_report_dir: Path,
+    kernels: list[str],
+    out_path: Path,
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    artifact_complete = True
+    ok_kernels = 0
+    missing_reports: list[str] = []
+    observed_execution_engines: set[str] = set()
+    observed_contract_schemas: set[str] = set()
+    runtime_fallback_kernels: set[str] = set()
+    require_cuda_llvm = _env_flag("INTENTIR_CUDA_REQUIRE_LLVM_PTX")
+
+    for kernel in list(kernels):
+        row: dict[str, Any] = {
+            "kernel": str(kernel),
+            "ok": False,
+            "reason_code": "",
+            "reason_detail": "",
+            "llvm_ir_path": "",
+            "execution_engine": "",
+            "contract_schema_version": "",
+            "runtime_fallback": False,
+            "runtime_fallback_detail": "",
+        }
+        report_path = provider_report_dir / f"{kernel}.json"
+        if not report_path.is_file():
+            row["reason_code"] = "provider_report_missing"
+            row["reason_detail"] = f"missing pipeline report: {report_path}"
+            artifact_complete = False
+            missing_reports.append(str(kernel))
+            rows.append(row)
+            continue
+
+        payload = _load_json(report_path)
+        mlir = payload.get("mlir")
+        if not isinstance(mlir, dict):
+            row["reason_code"] = "mlir_report_missing"
+            row["reason_detail"] = f"report lacks mlir section: {report_path}"
+            artifact_complete = False
+            rows.append(row)
+            continue
+        row["execution_engine"] = "mlir_native"
+        observed_execution_engines.add("mlir_native")
+        llvm_pipeline = str(mlir.get("llvm_pipeline") or "").strip()
+        effective_llvm_pipeline = str(llvm_pipeline)
+        if bool(require_cuda_llvm):
+            # Real-MLIR pipelines use `downstream_cuda_std_llvm`. Keep backward compatibility
+            # for older reports that still record `downstream_cuda_llvm`.
+            if not effective_llvm_pipeline:
+                effective_llvm_pipeline = "downstream_cuda_std_llvm"
+            elif effective_llvm_pipeline == "downstream_cuda_llvm":
+                effective_llvm_pipeline = "downstream_cuda_std_llvm"
+        row["llvm_pipeline"] = str(llvm_pipeline)
+        if str(effective_llvm_pipeline).strip():
+            row["llvm_pipeline"] = str(effective_llvm_pipeline)
+        expected_contract_key = ""
+        if effective_llvm_pipeline == "downstream_cuda_std_llvm":
+            expected_contract_key = "downstream_cuda_std_llvm_contract_path"
+        elif effective_llvm_pipeline == "downstream_cuda_llvm":
+            expected_contract_key = "downstream_cuda_llvm_contract_path"
+        elif effective_llvm_pipeline == "downstream_rvv_std_llvm":
+            expected_contract_key = "downstream_rvv_std_llvm_contract_path"
+        elif effective_llvm_pipeline == "downstream_rvv_llvm":
+            expected_contract_key = "downstream_rvv_llvm_contract_path"
+        if expected_contract_key:
+            expected_contract_raw = str(mlir.get(expected_contract_key) or "").strip()
+            if not expected_contract_raw:
+                row["reason_code"] = "llvm_contract_missing"
+                row["reason_detail"] = (
+                    f"missing {expected_contract_key} for llvm_pipeline={effective_llvm_pipeline}"
+                )
+                artifact_complete = False
+                rows.append(row)
+                continue
+            expected_contract_path = _resolve_report_path(expected_contract_raw, default_dir=ROOT)
+            if not expected_contract_path.is_file():
+                row["reason_code"] = "llvm_contract_missing"
+                row["reason_detail"] = (
+                    f"{expected_contract_key} path does not exist: {expected_contract_raw}"
+                )
+                artifact_complete = False
+                rows.append(row)
+                continue
+        contract_candidates: list[str] = []
+        if effective_llvm_pipeline in {"downstream_cuda_std_llvm", "downstream_cuda_llvm"}:
+            contract_candidates = [
+                "downstream_cuda_std_llvm_contract_path",
+                "downstream_cuda_llvm_contract_path",
+                "downstream_contract_path",
+                "downstream_llvm_contract_path",
+                "downstream_cuda_contract_path",
+            ]
+        elif effective_llvm_pipeline in {"downstream_rvv_std_llvm", "downstream_rvv_llvm"}:
+            contract_candidates = [
+                "downstream_rvv_std_llvm_contract_path",
+                "downstream_rvv_llvm_contract_path",
+                "downstream_contract_path",
+                "downstream_llvm_contract_path",
+                "downstream_rvv_contract_path",
+            ]
+        else:
+            contract_candidates = [
+                "downstream_cuda_llvm_contract_path",
+                "downstream_rvv_llvm_contract_path",
+                "downstream_llvm_contract_path",
+                "downstream_contract_path",
+                "downstream_cuda_contract_path",
+                "downstream_rvv_contract_path",
+            ]
+        contract_path_raw = ""
+        selected_contract_backend = ""
+        selected_contract_cuda_ptx_origin = ""
+        selected_contract_rvv_src_origin = ""
+        for key in contract_candidates:
+            cand = str(mlir.get(key) or "").strip()
+            if cand:
+                contract_path_raw = cand
+                break
+        if contract_path_raw:
+            contract_path = _resolve_report_path(contract_path_raw, default_dir=ROOT)
+            if contract_path.is_file():
+                contract_payload = _load_json(contract_path)
+                schema = str(contract_payload.get("schema_version") or "").strip()
+                if schema:
+                    row["contract_schema_version"] = schema
+                    observed_contract_schemas.add(schema)
+                contract_backend = str(contract_payload.get("backend") or "").strip().lower()
+                selected_contract_backend = str(contract_backend)
+                artifacts = dict(contract_payload.get("artifacts") or {})
+                executable = dict(contract_payload.get("executable") or {})
+                invocation = dict(executable.get("invocation") or {})
+                fallback_tags: list[str] = []
+                explicit_fallback = str(artifacts.get("runtime_fallback") or invocation.get("runtime_fallback") or "").strip()
+                if explicit_fallback:
+                    fallback_tags.append(explicit_fallback)
+                cuda_ptx_origin = str(artifacts.get("cuda_ptx_origin") or "").strip()
+                selected_contract_cuda_ptx_origin = str(cuda_ptx_origin)
+                if contract_backend == "cuda" and cuda_ptx_origin and cuda_ptx_origin != "llvm_llc":
+                    fallback_tags.append(f"cuda_ptx_origin={cuda_ptx_origin}")
+                rvv_src_origin = str(artifacts.get("rvv_kernel_src_origin") or "").strip()
+                selected_contract_rvv_src_origin = str(rvv_src_origin)
+                if contract_backend == "rvv" and rvv_src_origin and rvv_src_origin != "llvm_llc":
+                    fallback_tags.append(f"rvv_kernel_src_origin={rvv_src_origin}")
+                intent_recovery = str(artifacts.get("intent_recovery_fallback") or "").strip()
+                if intent_recovery:
+                    fallback_tags.append(f"intent_recovery_fallback={intent_recovery}")
+                if fallback_tags:
+                    row["runtime_fallback"] = True
+                    row["runtime_fallback_detail"] = ",".join(sorted(set(fallback_tags)))
+                    runtime_fallback_kernels.add(str(kernel))
+
+        llvm_emit_ok = bool(mlir.get("llvm_emit_ok"))
+        if str(effective_llvm_pipeline) and str(effective_llvm_pipeline) != str(llvm_pipeline):
+            trace = mlir.get(str(effective_llvm_pipeline))
+            if isinstance(trace, dict):
+                llvm_emit_ok = bool(trace.get("ok"))
+        llvm_path_raw = str(mlir.get("llvm_ir_path") or "").strip()
+        llvm_skip_reason = str(mlir.get("llvm_skip_reason") or "").strip()
+        if not llvm_skip_reason:
+            trace = None
+            trace_keys = [str(llvm_pipeline)] if str(llvm_pipeline).strip() else []
+            trace_keys += ["downstream_cuda_llvm", "downstream_rvv_llvm"]
+            for trace_key in trace_keys:
+                candidate = mlir.get(str(trace_key))
+                if isinstance(candidate, dict):
+                    trace = candidate
+                    if not str(llvm_pipeline).strip():
+                        row["llvm_pipeline"] = str(trace_key)
+                    break
+            if isinstance(trace, dict):
+                passes = [p for p in list(trace.get("passes") or []) if isinstance(p, dict)]
+                translate_rows = [p for p in passes if str(p.get("name") or "").startswith("mlir-translate")]
+                if translate_rows:
+                    last = dict(translate_rows[-1])
+                    last_detail = str(last.get("detail") or "").strip()
+                    if str(last_detail).startswith("skipped_optional_tool_unavailable:"):
+                        llvm_skip_reason = str(last_detail)
+                    elif not bool(last.get("ok")):
+                        llvm_skip_reason = (
+                            f"mlir_translate_failed:{last_detail}"
+                            if last_detail
+                            else "mlir_translate_failed"
+                        )
+
+        llvm_path = Path()
+        llvm_path_exists = False
+        if llvm_path_raw:
+            llvm_path = _resolve_report_path(llvm_path_raw, default_dir=ROOT)
+            llvm_path_exists = llvm_path.is_file()
+        allow_contract_only_cuda_llvm = bool(
+            require_cuda_llvm
+            and str(effective_llvm_pipeline) in {"downstream_cuda_std_llvm", "downstream_cuda_llvm"}
+            and str(selected_contract_backend) == "cuda"
+            and str(selected_contract_cuda_ptx_origin) == "llvm_llc"
+            and (not llvm_path_exists)
+        )
+
+        runtime_fallback = bool(row.get("runtime_fallback"))
+        runtime_fallback_detail = str(row.get("runtime_fallback_detail") or "").strip()
+        if llvm_emit_ok and (llvm_path_exists or allow_contract_only_cuda_llvm) and (not runtime_fallback):
+            row["ok"] = True
+            row["reason_code"] = "ok"
+            row["reason_detail"] = (
+                "llvm artifact present"
+                if bool(llvm_path_exists)
+                else "cuda llvm contract present (llvmlc-ptx) without standalone llvm_ir_path"
+            )
+            row["llvm_ir_path"] = str(llvm_path) if llvm_path_exists else ""
+            ok_kernels += 1
+        elif llvm_emit_ok and llvm_path_exists and runtime_fallback:
+            row["reason_code"] = "runtime_fallback_present"
+            row["reason_detail"] = (
+                runtime_fallback_detail
+                if runtime_fallback_detail
+                else "runtime fallback marker present in contract artifacts"
+            )
+            artifact_complete = False
+        elif llvm_emit_ok and (not llvm_path_exists):
+            row["reason_code"] = "llvm_artifact_missing"
+            row["reason_detail"] = f"llvm_emit_ok=true but llvm_ir_path missing: {llvm_path_raw}"
+            artifact_complete = False
+        elif llvm_skip_reason:
+            row["reason_code"] = "llvm_emit_skipped"
+            row["reason_detail"] = str(llvm_skip_reason)
+            artifact_complete = False
+        else:
+            row["reason_code"] = "llvm_emit_not_recorded"
+            row["reason_detail"] = "mlir report has no llvm_emit evidence"
+            artifact_complete = False
+        rows.append(row)
+
+    execution_engine = ""
+    if len(observed_execution_engines) == 1:
+        execution_engine = next(iter(observed_execution_engines))
+    elif len(observed_execution_engines) > 1:
+        execution_engine = "mixed"
+    contract_schema_version = ""
+    if len(observed_contract_schemas) == 1:
+        contract_schema_version = next(iter(observed_contract_schemas))
+    elif len(observed_contract_schemas) > 1:
+        contract_schema_version = "mixed"
+
+    payload = {
+        "schema_version": "flaggems_mlir_llvm_artifacts_v1",
+        "repo": repo_state(root=ROOT),
+        "execution_engine": execution_engine,
+        "contract_schema_version": contract_schema_version,
+        "provider_report_dir": str(provider_report_dir),
+        "kernel_count_expected": int(len(list(kernels))),
+        "kernel_count_checked": int(len(rows)),
+        "kernel_count_ok": int(ok_kernels),
+        "artifact_complete": bool(artifact_complete),
+        "runtime_fallback_kernel_count": int(len(runtime_fallback_kernels)),
+        "runtime_fallback_kernels": sorted(runtime_fallback_kernels),
+        "missing_provider_reports": list(missing_reports),
+        "entries": rows,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return payload
+
+
+def _resolve_suite_and_kernel_filter(
+    *,
+    requested_suite: str,
+    requested_kernels: list[str],
+    flaggems_opset: str,
+    backend_target: str,
+) -> tuple[str, list[str]]:
+    suite = str(requested_suite)
+    kernels_raw = [str(k) for k in (requested_kernels or []) if str(k).strip()]
+    kernels: list[str] = []
+    for k in kernels_raw:
+        if k not in kernels:
+            kernels.append(k)
+
+    if not kernels:
+        if suite in {"coverage", "all"}:
+            return "coverage", _suite_kernel_names(
+                suite="coverage",
+                flaggems_opset=str(flaggems_opset),
+                backend_target=str(backend_target),
+            )
+        return suite, []
+
+    if suite == "smoke":
+        smoke = set(
+            _suite_kernel_names(
+                suite="smoke",
+                flaggems_opset=str(flaggems_opset),
+                backend_target=str(backend_target),
+            )
+        )
+        missing_from_smoke = [k for k in kernels if k not in smoke]
+        if not missing_from_smoke:
+            return "smoke", kernels
+
+        coverage = set(
+            _suite_kernel_names(
+                suite="coverage",
+                flaggems_opset=str(flaggems_opset),
+                backend_target=str(backend_target),
+            )
+        )
+        unknown = [k for k in missing_from_smoke if k not in coverage]
+        if unknown:
+            raise SystemExit(
+                f"unknown kernel(s) for deterministic_forward opset: {', '.join(sorted(set(unknown)))}"
+            )
+        return "coverage", kernels
+
+    coverage = set(
+        _suite_kernel_names(
+            suite="coverage",
+            flaggems_opset=str(flaggems_opset),
+            backend_target=str(backend_target),
+        )
+    )
+    unknown = [k for k in kernels if k not in coverage]
+    if unknown:
+        raise SystemExit(f"unknown kernel(s) for deterministic_forward opset: {', '.join(sorted(set(unknown)))}")
+    return "coverage", kernels
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--suite", choices=["smoke", "coverage", "all"], default="smoke")
+    ap.add_argument("--kernel", action="append", default=[], help="repeatable; optional kernel filter")
+    ap.add_argument(
+        "--shape",
+        action="append",
+        default=[],
+        help="Forward canonical shape overrides to the pipeline artifact build, e.g. --shape N=32. "
+        "Requires exactly one --kernel.",
+    )
+    ap.add_argument("--cases-limit", type=int, default=8)
+    ap.add_argument(
+        "--flaggems-path",
+        choices=["original", "intentir"],
+        default="intentir",
+        help="Execution path for FlagGems pipeline stage.",
+    )
+    ap.add_argument(
+        "--intentir-mode",
+        choices=["auto", "force_compile", "force_cache"],
+        default="auto",
+        help="IntentIR mode (only valid when --flaggems-path=intentir).",
+    )
+    ap.add_argument(
+        "--intentir-miss-policy",
+        choices=["deterministic", "strict"],
+        default="deterministic",
+        help="IntentIR miss policy passed to FlagGems full pipeline script.",
+    )
+    ap.add_argument("--seed-cache-dir", type=Path, default=(ROOT / "artifacts" / "flaggems_seed_cache"))
+    ap.add_argument("--pipeline-out-dir", type=Path, default=(ROOT / "artifacts" / "flaggems_triton_full_pipeline"))
+    ap.add_argument("--active-batch", type=Path, default=None)
+    ap.add_argument("--flaggems-opset", choices=["deterministic_forward"], default="deterministic_forward")
+    ap.add_argument("--backend-target", choices=["rvv", "cuda_h100", "cuda_5090d"], default="rvv")
+    ap.add_argument(
+        "--lane",
+        choices=["coverage", "ir_arch", "backend_compiler"],
+        default="coverage",
+        help="Workflow lane used to resolve active semantic scope (default: coverage).",
+    )
+    ap.add_argument(
+        "--stream-subprocess-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream subprocess logs (pipeline/backend/converge) to console in real time.",
+    )
+    ap.add_argument("--skip-pipeline", action="store_true")
+    ap.add_argument("--skip-rvv", action="store_true")
+    ap.add_argument(
+        "--skip-rvv-local",
+        action="store_true",
+        help="Skip RVV local stage only; useful when focusing on rvv_remote evidence.",
+    )
+    ap.add_argument("--skip-cuda", action="store_true")
+    ap.add_argument(
+        "--run-rvv-remote",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also run RVV remote suite via SSH after local RVV stage.",
+    )
+    ap.add_argument("--rvv-host", default=os.getenv("INTENTIR_RVV_HOST", "192.168.8.72"))
+    ap.add_argument("--rvv-user", default=os.getenv("INTENTIR_RVV_USER", "ubuntu"))
+    ap.add_argument("--rvv-port", type=int, default=22)
+    ap.add_argument(
+        "--rvv-remote-timeout-sec",
+        type=int,
+        default=600,
+        help="Timeout (seconds) for rvv_remote stage (0 disables timeout).",
+    )
+    ap.add_argument(
+        "--rvv-use-key",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use SSH key auth for rvv_remote_suite (default true).",
+    )
+    ap.add_argument(
+        "--allow-cuda-skip",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow CUDA stage to exit 0 with skipped status when CUDA env is unavailable.",
+    )
+    ap.add_argument(
+        "--cuda-timeout-sec",
+        type=int,
+        default=120,
+        help="Compatibility timeout passed to cuda_backend_smoke.py.",
+    )
+    ap.add_argument(
+        "--cuda-compile-timeout-sec",
+        type=int,
+        default=None,
+        help="CUDA compile-stage timeout passed to cuda_backend_smoke.py.",
+    )
+    ap.add_argument(
+        "--cuda-launch-timeout-sec",
+        type=int,
+        default=None,
+        help="CUDA launch-stage timeout passed to cuda_backend_smoke.py.",
+    )
+    ap.add_argument(
+        "--pipeline-timeout-sec",
+        type=int,
+        default=0,
+        help="Timeout (seconds) for the pipeline stage (0 disables timeout).",
+    )
+    ap.add_argument(
+        "--cuda-runtime-backend",
+        choices=["auto", "nvcc", "nvrtc"],
+        default="auto",
+        help="Runtime backend selector passed to cuda_backend_smoke.py (default: auto).",
+    )
+    ap.add_argument(
+        "--schedule-profile-tag",
+        default="",
+        help="Optional profile tag suffix for backend schedule selection.",
+    )
+    ap.add_argument("--cuda-tile-m", type=int, default=None)
+    ap.add_argument("--cuda-tile-n", type=int, default=None)
+    ap.add_argument("--cuda-tile-k", type=int, default=None)
+    ap.add_argument("--rvv-tile-m", type=int, default=None)
+    ap.add_argument("--rvv-tile-n", type=int, default=None)
+    ap.add_argument("--rvv-tile-k", type=int, default=None)
+    date_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+    ap.add_argument("--out-dir", type=Path, default=(ROOT / "artifacts" / "flaggems_matrix" / "daily" / date_tag))
+    ap.add_argument("--write-registry", action="store_true")
+    args = ap.parse_args()
+    miss_policy = str(args.intentir_miss_policy)
+    shape_overrides = _parse_shape_overrides(getattr(args, "shape", None))
+    execution_ir = _execution_ir_mode()
+    require_mlir_artifacts = str(execution_ir) == "mlir"
+    if str(args.flaggems_path) == "original" and str(args.intentir_mode) != "auto":
+        raise SystemExit("--intentir-mode is only valid when --flaggems-path=intentir")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pipeline_out_dir = Path(args.pipeline_out_dir)
+    pipeline_out_dir.mkdir(parents=True, exist_ok=True)
+    seed_cache_dir = Path(args.seed_cache_dir)
+    seed_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    stage_results: list[dict[str, Any]] = []
+    explicit_kernel_filter = [str(k).strip() for k in (args.kernel or []) if str(k).strip()]
+    effective_suite, kernel_filter = _resolve_suite_and_kernel_filter(
+        requested_suite=str(args.suite),
+        requested_kernels=list(explicit_kernel_filter),
+        flaggems_opset=str(args.flaggems_opset),
+        backend_target=str(args.backend_target),
+    )
+    if shape_overrides and len(kernel_filter) != 1:
+        raise SystemExit("--shape requires exactly one --kernel in matrix mode")
+    scoped_kernels = list(kernel_filter)
+    if not scoped_kernels:
+        scoped_kernels = _suite_kernel_names(
+            suite=str(effective_suite),
+            flaggems_opset=str(args.flaggems_opset),
+            backend_target=str(args.backend_target),
+        )
+    default_active = ROOT / "workflow" / "flaggems" / "state" / f"active_batch_{args.lane}.json"
+    active_batch_path = Path(args.active_batch) if args.active_batch is not None else default_active
+    scoped_semantic_ops = _load_active_semantic_ops(active_batch_path)
+    profile_tag = str(args.schedule_profile_tag or "").strip()
+    rvv_env: dict[str, str] = {}
+    cuda_env: dict[str, str] = {}
+    if profile_tag:
+        rvv_env["INTENTIR_RVV_SCHEDULE_PROFILE_TAG"] = profile_tag
+        cuda_env["INTENTIR_CUDA_SCHEDULE_PROFILE_TAG"] = profile_tag
+        rvv_env["INTENTIR_SCHEDULE_PROFILE_TAG"] = profile_tag
+        cuda_env["INTENTIR_SCHEDULE_PROFILE_TAG"] = profile_tag
+    if args.rvv_tile_m is not None:
+        rvv_env["INTENTIR_RVV_TILE_M"] = str(int(args.rvv_tile_m))
+    if args.rvv_tile_n is not None:
+        rvv_env["INTENTIR_RVV_TILE_N"] = str(int(args.rvv_tile_n))
+    if args.rvv_tile_k is not None:
+        rvv_env["INTENTIR_RVV_TILE_K"] = str(int(args.rvv_tile_k))
+    if args.cuda_tile_m is not None:
+        cuda_env["INTENTIR_CUDA_TILE_M"] = str(int(args.cuda_tile_m))
+    if args.cuda_tile_n is not None:
+        cuda_env["INTENTIR_CUDA_TILE_N"] = str(int(args.cuda_tile_n))
+    if args.cuda_tile_k is not None:
+        cuda_env["INTENTIR_CUDA_TILE_K"] = str(int(args.cuda_tile_k))
+
+    def _record(stage: str, rc: int, stdout: str, stderr: str, extra: dict | None = None) -> None:
+        row = {
+            "stage": str(stage),
+            "rc": int(rc),
+            "ok": int(rc) == 0,
+            "stdout": stdout.strip(),
+            "stderr": stderr.strip(),
+        }
+        if extra:
+            row.update(extra)
+        stage_results.append(row)
+
+    if not bool(args.skip_pipeline):
+        cmd = [
+            sys.executable,
+            "scripts/triton/flaggems_full_pipeline_verify.py",
+            "--suite",
+            str(effective_suite),
+            "--cases-limit",
+            str(int(args.cases_limit)),
+            "--flaggems-opset",
+            str(args.flaggems_opset),
+            "--backend-target",
+            str(args.backend_target),
+            "--flaggems-path",
+            str(args.flaggems_path),
+            "--intentir-mode",
+            str(args.intentir_mode),
+            "--intentir-miss-policy",
+            miss_policy,
+            "--strict-kernel-failure",
+            "--seed-cache-dir",
+            str(seed_cache_dir),
+            "--out-dir",
+            str(pipeline_out_dir),
+        ]
+        for k in kernel_filter:
+            cmd += ["--kernel", str(k)]
+        for key, value in sorted(shape_overrides.items()):
+            cmd += ["--shape", f"{key}={int(value)}"]
+        print(f"[matrix] stage=pipeline kernels={len(kernel_filter) if kernel_filter else len(scoped_kernels)}", flush=True)
+        rc, out, err, timed_out = _run_with_timeout(
+            cmd,
+            cwd=ROOT,
+            stream_output=bool(args.stream_subprocess_output),
+            timeout_sec=int(args.pipeline_timeout_sec),
+        )
+        pipeline_extra = {"cmd": cmd}
+        if bool(timed_out):
+            pipeline_extra["reason_code"] = "pipeline_timeout"
+            pipeline_extra["timeout_sec"] = int(args.pipeline_timeout_sec)
+        _record("pipeline", rc, out, err, extra=pipeline_extra)
+
+    missing_provider_reports = _collect_missing_provider_reports(pipeline_out_dir, scoped_kernels)
+    if missing_provider_reports:
+        _record(
+            "provider_report_precheck",
+            1,
+            "",
+            "missing provider report(s) for requested kernels",
+            extra={
+                "reason_code": "pipeline_missing_report",
+                "missing_provider_reports": list(missing_provider_reports),
+                "provider_report_dir": str(pipeline_out_dir),
+            },
+        )
+    else:
+        _record(
+            "provider_report_precheck",
+            0,
+            f"provider reports complete for {len(scoped_kernels)} kernel(s)",
+            "",
+            extra={"provider_report_dir": str(pipeline_out_dir)},
+        )
+
+    mlir_llvm_artifacts = out_dir / "mlir_llvm_artifacts.json"
+    if not missing_provider_reports:
+        llvm_payload = _collect_mlir_llvm_artifacts(
+            provider_report_dir=pipeline_out_dir,
+            kernels=scoped_kernels,
+            out_path=mlir_llvm_artifacts,
+        )
+        llvm_complete = bool(llvm_payload.get("artifact_complete"))
+        _record(
+            "mlir_llvm_artifacts",
+            0,
+            (
+                f"llvm artifacts {'complete' if llvm_complete else 'incomplete'} "
+                f"for {int(llvm_payload.get('kernel_count_checked') or 0)} kernel(s)"
+            ),
+            "",
+            extra={
+                "json_path": str(mlir_llvm_artifacts),
+                "artifact_complete": bool(llvm_complete),
+                "kernel_count_ok": int(llvm_payload.get("kernel_count_ok") or 0),
+                "kernel_count_expected": int(llvm_payload.get("kernel_count_expected") or 0),
+                "reason_code": ("ok" if llvm_complete else "llvm_artifacts_incomplete"),
+            },
+        )
+    else:
+        llvm_payload = {
+            "schema_version": "flaggems_mlir_llvm_artifacts_v1",
+            "repo": repo_state(root=ROOT),
+            "execution_engine": "mlir_native",
+            "contract_schema_version": "",
+            "provider_report_dir": str(pipeline_out_dir),
+            "kernel_count_expected": int(len(scoped_kernels)),
+            "kernel_count_checked": 0,
+            "kernel_count_ok": 0,
+            "artifact_complete": False,
+            "runtime_fallback_kernel_count": 0,
+            "runtime_fallback_kernels": [],
+            "missing_provider_reports": list(missing_provider_reports),
+            "entries": [],
+        }
+        mlir_llvm_artifacts.write_text(json.dumps(llvm_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        llvm_complete = False
+        _record(
+            "mlir_llvm_artifacts",
+            0,
+            "llvm artifact check skipped: provider reports missing",
+            "",
+            extra={
+                "json_path": str(mlir_llvm_artifacts),
+                "artifact_complete": False,
+                "reason_code": "skipped_missing_provider_reports",
+            },
+        )
+    execution_engine = str(llvm_payload.get("execution_engine") or "").strip() or "mlir_native"
+    contract_schema_version = str(llvm_payload.get("contract_schema_version") or "").strip() or "intent_mlir_backend_contract_v2"
+    runtime_fallback_kernels = [str(x) for x in list(llvm_payload.get("runtime_fallback_kernels") or []) if str(x).strip()]
+
+    rvv_json = out_dir / "rvv_local.json"
+    if not bool(args.skip_rvv) and (not bool(args.skip_rvv_local)) and not missing_provider_reports:
+        cmd = [
+            sys.executable,
+            "scripts/backend_codegen_smoke.py",
+            "--frontend",
+            "triton",
+            "--triton-provider",
+            "flaggems",
+            "--flaggems-opset",
+            str(args.flaggems_opset),
+            "--backend-target",
+            "rvv",
+            "--artifact-dir",
+            str(pipeline_out_dir),
+            "--require-mlir-artifacts" if bool(require_mlir_artifacts) else "--no-require-mlir-artifacts",
+            "--json",
+            "--out",
+            str(rvv_json),
+        ]
+        if bool(args.stream_subprocess_output):
+            cmd.append("--progress")
+        for k in kernel_filter:
+            cmd += ["--kernel", str(k)]
+        cmd_run = _with_env_prefix(cmd, rvv_env)
+        print("[matrix] stage=rvv_local", flush=True)
+        rc, out, err = _run(cmd_run, cwd=ROOT, stream_output=bool(args.stream_subprocess_output))
+        _record(
+            "rvv_local",
+            rc,
+            out,
+            err,
+            extra={"cmd": cmd_run, "json_path": str(rvv_json), "env_overrides": dict(rvv_env)},
+        )
+
+    rvv_remote_json = out_dir / "rvv_remote.json"
+    if bool(args.run_rvv_remote) and not bool(args.skip_rvv) and not missing_provider_reports:
+        cmd = [
+            sys.executable,
+            "scripts/rvv_remote_suite.py",
+            "--frontend",
+            "triton",
+            "--suite",
+            str(effective_suite),
+            "--triton-provider",
+            "flaggems",
+            "--flaggems-opset",
+            str(args.flaggems_opset),
+            "--backend-target",
+            "rvv",
+            "--artifact-dir",
+            str(pipeline_out_dir),
+            "--host",
+            str(args.rvv_host),
+            "--user",
+            str(args.rvv_user),
+            "--port",
+            str(int(args.rvv_port)),
+            "--out",
+            str(rvv_remote_json),
+            "--require-mlir-artifacts" if bool(require_mlir_artifacts) else "--no-require-mlir-artifacts",
+        ]
+        if bool(args.rvv_use_key):
+            cmd.append("--use-key")
+        for k in kernel_filter:
+            cmd += ["--kernel", str(k)]
+        cmd_run = _with_env_prefix(cmd, rvv_env)
+        print("[matrix] stage=rvv_remote", flush=True)
+        rc, out, err, timed_out = _run_with_timeout(
+            cmd_run,
+            cwd=ROOT,
+            stream_output=bool(args.stream_subprocess_output),
+            timeout_sec=int(args.rvv_remote_timeout_sec),
+        )
+        rvv_extra = {"cmd": cmd_run, "json_path": str(rvv_remote_json), "env_overrides": dict(rvv_env)}
+        if bool(timed_out):
+            rvv_extra["reason_code"] = "rvv_remote_timeout"
+            rvv_extra["timeout_sec"] = int(args.rvv_remote_timeout_sec)
+        _record(
+            "rvv_remote",
+            rc,
+            out,
+            err,
+            extra=rvv_extra,
+        )
+
+    cuda_json = out_dir / "cuda_local.json"
+    if not bool(args.skip_cuda) and not missing_provider_reports:
+        cuda_backend_target = str(args.backend_target)
+        if cuda_backend_target not in {"cuda_h100", "cuda_5090d"}:
+            # Default to the legacy H100 target when the matrix was invoked for
+            # RVV, while still allowing explicit CUDA target selection.
+            cuda_backend_target = "cuda_h100"
+        cuda_compile_timeout_sec = (
+            int(args.cuda_compile_timeout_sec)
+            if args.cuda_compile_timeout_sec is not None
+            else int(args.cuda_timeout_sec)
+        )
+        cuda_launch_timeout_sec = (
+            int(args.cuda_launch_timeout_sec)
+            if args.cuda_launch_timeout_sec is not None
+            else int(args.cuda_timeout_sec)
+        )
+        cmd = [
+            sys.executable,
+            "scripts/cuda_backend_smoke.py",
+            "--frontend",
+            "triton",
+            "--triton-provider",
+            "flaggems",
+            "--flaggems-opset",
+            str(args.flaggems_opset),
+            "--backend-target",
+            str(cuda_backend_target),
+            "--artifact-dir",
+            str(pipeline_out_dir),
+            "--timeout-sec",
+            str(int(args.cuda_timeout_sec)),
+            "--compile-timeout-sec",
+            str(int(cuda_compile_timeout_sec)),
+            "--launch-timeout-sec",
+            str(int(cuda_launch_timeout_sec)),
+            "--runtime-backend",
+            str(args.cuda_runtime_backend),
+            "--require-mlir-artifacts" if bool(require_mlir_artifacts) else "--no-require-mlir-artifacts",
+            "--json",
+            "--out",
+            str(cuda_json),
+        ]
+        if bool(args.stream_subprocess_output):
+            cmd.append("--progress")
+        if bool(args.allow_cuda_skip):
+            cmd.append("--allow-skip")
+        for k in kernel_filter:
+            cmd += ["--kernel", str(k)]
+        cmd_run = _with_env_prefix(cmd, cuda_env)
+        print("[matrix] stage=cuda_local", flush=True)
+        rc, out, err = _run(cmd_run, cwd=ROOT, stream_output=bool(args.stream_subprocess_output))
+        _record(
+            "cuda_local",
+            rc,
+            out,
+            err,
+            extra={"cmd": cmd_run, "json_path": str(cuda_json), "env_overrides": dict(cuda_env)},
+        )
+
+    stage_timing_breakdown = out_dir / "stage_timing_breakdown.json"
+    rvv_timing_json = rvv_remote_json if rvv_remote_json.is_file() else rvv_json
+    if rvv_timing_json.is_file() and cuda_json.is_file():
+        cmd = [
+            sys.executable,
+            "scripts/flaggems/compute_stage_timing_breakdown.py",
+            "--rvv-json",
+            str(rvv_timing_json),
+            "--cuda-json",
+            str(cuda_json),
+            "--pipeline-reports-dir",
+            str(pipeline_out_dir),
+            "--out",
+            str(stage_timing_breakdown),
+            "--intentir-mode",
+            str(args.intentir_mode),
+            "--intentir-miss-policy",
+            str(miss_policy),
+            "--cuda-runtime-backend",
+            str(args.cuda_runtime_backend),
+        ]
+        for k in kernel_filter:
+            cmd += ["--kernel", str(k)]
+        cmd.append("--rvv-remote" if bool(args.run_rvv_remote) else "--no-rvv-remote")
+        print("[matrix] stage=stage_timing_breakdown", flush=True)
+        rc, out, err = _run(cmd, cwd=ROOT, stream_output=bool(args.stream_subprocess_output))
+        _record("stage_timing_breakdown", rc, out, err, extra={"cmd": cmd, "json_path": str(stage_timing_breakdown)})
+    else:
+        _record(
+            "stage_timing_breakdown",
+            0,
+            "stage timing breakdown skipped (rvv_remote/rvv_local + cuda json not both present)",
+            "",
+            extra={
+                "reason_code": "skipped_missing_backend_json",
+                "json_path": str(stage_timing_breakdown),
+                "rvv_json_used": str(rvv_timing_json),
+                "cuda_json_used": str(cuda_json),
+            },
+        )
+
+    converged = out_dir / "status_converged.json"
+    cmd = [
+        sys.executable,
+        "scripts/flaggems/converge_status.py",
+        "--provider-report-dir",
+        str(pipeline_out_dir),
+        "--out",
+        str(converged),
+        "--intentir-mode",
+        str(args.intentir_mode),
+        "--intentir-miss-policy",
+        str(miss_policy),
+        "--cuda-runtime-backend",
+        str(args.cuda_runtime_backend),
+        "--execution-engine",
+        str(execution_engine),
+        "--contract-schema-version",
+        str(contract_schema_version),
+    ]
+    cmd.append("--rvv-remote" if bool(args.run_rvv_remote) else "--no-rvv-remote")
+    if rvv_remote_json.is_file():
+        cmd += ["--rvv-json", str(rvv_remote_json)]
+    elif rvv_json.is_file():
+        cmd += ["--rvv-json", str(rvv_json)]
+    if cuda_json.is_file():
+        cmd += ["--cuda-json", str(cuda_json)]
+    for k in scoped_kernels:
+        cmd += ["--scope-kernels", str(k)]
+    for sop in scoped_semantic_ops:
+        cmd += ["--scope-semantic-ops", str(sop)]
+    scope_mode = "active_only" if scoped_semantic_ops else "kernel_alias"
+    cmd += ["--scope-mode", str(scope_mode)]
+    if bool(args.write_registry):
+        cmd.append("--write-registry")
+    print("[matrix] stage=converge", flush=True)
+    rc, out, err = _run(cmd, cwd=ROOT, stream_output=bool(args.stream_subprocess_output))
+    _record("converge", rc, out, err, extra={"cmd": cmd, "json_path": str(converged)})
+    if int(rc) == 0 and converged.is_file() and bool(explicit_kernel_filter):
+        projected = _project_status_converged_to_scope(status_converged_path=converged)
+        if bool(projected):
+            print("[matrix] scoped convergence projection applied", flush=True)
+
+    coverage_integrity = out_dir / "coverage_integrity.json"
+    full_coverage_run = (str(effective_suite) == "coverage") and (len(explicit_kernel_filter) == 0)
+    if converged.is_file() and full_coverage_run:
+        cmd = [
+            sys.executable,
+            "scripts/flaggems/recompute_coverage_integrity.py",
+            "--registry",
+            str(ROOT / "pipeline" / "triton" / "flaggems_registry.json"),
+            "--run-summary",
+            str(out_dir / "run_summary.json"),
+            "--status-converged",
+            str(converged),
+            "--out",
+            str(coverage_integrity),
+        ]
+        # run_summary.json is written after this stage block; emit a temporary run summary
+        # with stages seen so far to satisfy recompute input contract.
+        tmp_summary = {
+            "ok": all(bool(r.get("ok")) for r in stage_results),
+            "repo": repo_state(root=ROOT),
+            "execution_engine": str(execution_engine),
+            "contract_schema_version": str(contract_schema_version),
+            "stages": stage_results,
+        }
+        (out_dir / "run_summary.json").write_text(json.dumps(tmp_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        print("[matrix] stage=coverage_integrity", flush=True)
+        rc, out, err = _run(cmd, cwd=ROOT, stream_output=bool(args.stream_subprocess_output))
+        _record("coverage_integrity", rc, out, err, extra={"cmd": cmd, "json_path": str(coverage_integrity)})
+    else:
+        _record(
+            "coverage_integrity",
+            0,
+            "coverage integrity skipped for partial scope run",
+            "",
+            extra={
+                "reason_code": "skipped_partial_scope",
+                "full_coverage_run": bool(full_coverage_run),
+                "json_path": str(coverage_integrity),
+            },
+        )
+
+    ok = all(bool(r.get("ok")) for r in stage_results)
+    summary = {
+        "ok": bool(ok),
+        "repo": repo_state(root=ROOT),
+        "execution_engine": str(execution_engine),
+        "contract_schema_version": str(contract_schema_version),
+        "runtime_fallback_kernel_count": int(len(runtime_fallback_kernels)),
+        "runtime_fallback_kernels": list(runtime_fallback_kernels),
+        "invocation": {
+            "intentir_mode": str(args.intentir_mode),
+            "miss_policy": str(miss_policy),
+            "rvv_remote": bool(args.run_rvv_remote),
+            "cuda_runtime_backend": str(args.cuda_runtime_backend),
+            "execution_ir": str(execution_ir),
+            "execution_engine": str(execution_engine),
+            "contract_schema_version": str(contract_schema_version),
+            "require_mlir_artifacts": bool(require_mlir_artifacts),
+            "pipeline_timeout_sec": int(args.pipeline_timeout_sec),
+            "rvv_remote_timeout_sec": int(args.rvv_remote_timeout_sec),
+        },
+        "lane": str(args.lane),
+        "requested_suite": str(args.suite),
+        "suite": str(effective_suite),
+        "kernel_filter": list(kernel_filter),
+        "scope_kernels": list(scoped_kernels),
+        "scope_kernels_count": int(len(scoped_kernels)),
+        "missing_provider_reports": list(missing_provider_reports),
+        "flaggems_path": str(args.flaggems_path),
+        "intentir_mode": str(args.intentir_mode),
+        "execution_ir": str(execution_ir),
+        "require_mlir_artifacts": bool(require_mlir_artifacts),
+        "flaggems_opset": str(args.flaggems_opset),
+        "backend_target": str(args.backend_target),
+        "cuda_timeout_sec": int(args.cuda_timeout_sec),
+        "cuda_compile_timeout_sec": (
+            int(args.cuda_compile_timeout_sec)
+            if args.cuda_compile_timeout_sec is not None
+            else int(args.cuda_timeout_sec)
+        ),
+        "cuda_launch_timeout_sec": (
+            int(args.cuda_launch_timeout_sec)
+            if args.cuda_launch_timeout_sec is not None
+            else int(args.cuda_timeout_sec)
+        ),
+        "cuda_runtime_backend": str(args.cuda_runtime_backend),
+        "pipeline_timeout_sec": int(args.pipeline_timeout_sec),
+        "rvv_remote_timeout_sec": int(args.rvv_remote_timeout_sec),
+        "intentir_miss_policy": miss_policy,
+        "schedule_profile_tag": profile_tag,
+        "rvv_schedule_overrides": dict(rvv_env),
+        "cuda_schedule_overrides": dict(cuda_env),
+        "seed_cache_dir": str(seed_cache_dir),
+        "pipeline_out_dir": str(pipeline_out_dir),
+        "active_batch_path": str(active_batch_path),
+        "skip_rvv_local": bool(args.skip_rvv_local),
+        "mlir_llvm_artifact_complete": bool(llvm_complete),
+        "mlir_llvm_chain_ok": bool(llvm_complete),
+        "mlir_llvm_artifacts_path": str(mlir_llvm_artifacts),
+        "stages": stage_results,
+        "out_dir": str(out_dir),
+    }
+    summary_path = out_dir / "run_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Matrix summary written: {summary_path}")
+    raise SystemExit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intentir"
+version = "0.1.0"
+description = "Certified semantic lifting and unified IR for optimized ML kernel assets."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26,<2",
+  "requests>=2.32",
+  "paramiko>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+]
+gpu = [
+  "triton",
+  "tilelang",
+  "flag_gems",
+]
+
+[tool.setuptools.packages.find]
+include = [
+  "intent_ir*",
+  "frontends*",
+  "pipeline*",
+  "backends*",
+  "kernels*",
+  "verify*",
+]
+
+[tool.setuptools.package-data]
+intent_ir = ["mlir/pipelines/*.yaml"]
+frontends = ["tilelang/shims/*.h"]
+backends = ["spmd_rvv/runtime/*"]
+pipeline = ["triton/*.json"]
+kernels = ["cuda/ops/*.cu"]
+
+[tool.pytest.ini_options]
+testpaths = [
+  "tests/core",
+  "tests/mlir",
+  "tests/frontends/triton",
+  "tests/pipeline",
+  "tests/test_pipeline_batch.py",
+]
+pythonpath = ["."]

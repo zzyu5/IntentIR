@@ -1,0 +1,222 @@
+#pragma once
+
+#include <stdint.h>
+
+// -----------------------------------------------------------------------------
+// Common CUDA device helpers for IntentIR-generated kernels.
+//
+// The goal is to keep codegen in Python, but move reusable low-level pieces
+// (loads, RNG, reductions) into a stable runtime header, similar in spirit to
+// backends/spmd_rvv/runtime/*.
+// -----------------------------------------------------------------------------
+
+template <typename T>
+__device__ __forceinline__ T intentir_ldg(const T* p) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
+  return __ldg(p);
+#else
+  return *p;
+#endif
+}
+
+__device__ __forceinline__ float intentir_ldg_f32(const float* p) { return intentir_ldg<float>(p); }
+
+// -----------------------------------------------------------------------------
+// Async copy helpers (Ampere+).
+//
+// We use cp.async to overlap global->shared loads with tensor core compute in
+// generated matmul kernels. For older GPUs, we fall back to a normal load/store.
+// -----------------------------------------------------------------------------
+
+__device__ __forceinline__ void intentir_cp_async_ca_16(void* smem_dst, const void* gmem_src) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  const unsigned int smem = __cvta_generic_to_shared(smem_dst);
+  asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 16;\n" : : "r"(smem), "l"(gmem_src) : "memory");
+#else
+  // Fallback: synchronous copy (16 bytes).
+  *reinterpret_cast<float4*>(smem_dst) = *reinterpret_cast<const float4*>(gmem_src);
+#endif
+}
+
+__device__ __forceinline__ void intentir_cp_async_cg_16(void* smem_dst, const void* gmem_src) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  const unsigned int smem = __cvta_generic_to_shared(smem_dst);
+  asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" : : "r"(smem), "l"(gmem_src) : "memory");
+#else
+  *reinterpret_cast<float4*>(smem_dst) = *reinterpret_cast<const float4*>(gmem_src);
+#endif
+}
+
+// Default policy: bypass L1 to reduce thrash for streaming tiles.
+__device__ __forceinline__ void intentir_cp_async_16(void* smem_dst, const void* gmem_src) {
+  intentir_cp_async_cg_16(smem_dst, gmem_src);
+}
+
+__device__ __forceinline__ void intentir_cp_async_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.commit_group;\n" : : : "memory");
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void intentir_cp_async_wait_group();
+
+template <>
+__device__ __forceinline__ void intentir_cp_async_wait_group<0>() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.wait_group 0;\n" : : : "memory");
+#endif
+}
+
+template <>
+__device__ __forceinline__ void intentir_cp_async_wait_group<1>() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.wait_group 1;\n" : : : "memory");
+#endif
+}
+
+template <>
+__device__ __forceinline__ void intentir_cp_async_wait_group<2>() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.wait_group 2;\n" : : : "memory");
+#endif
+}
+
+template <>
+__device__ __forceinline__ void intentir_cp_async_wait_group<3>() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.wait_group 3;\n" : : : "memory");
+#endif
+}
+
+__device__ __forceinline__ void intentir_cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  intentir_cp_async_wait_group<0>();
+#endif
+}
+
+// -----------------------------------------------------------------------------
+// Philox RNG (matches semantics used by the RVV backend runtime).
+// -----------------------------------------------------------------------------
+
+template <int N_ROUNDS>
+__device__ __forceinline__ uint32_t intentir_philox_randint_u32_rounds(uint64_t seed, uint32_t c0) {
+  static_assert(N_ROUNDS > 0 && N_ROUNDS <= 10, "intentir_philox_randint_u32_rounds supports 1..10 rounds");
+  uint32_t c1 = 0u, c2 = 0u, c3 = 0u;
+  uint32_t k0 = (uint32_t)(seed & 0xFFFFFFFFu);
+  uint32_t k1 = (uint32_t)((seed >> 32) & 0xFFFFFFFFu);
+  const uint32_t PHILOX_KEY_A = 0x9E3779B9u;
+  const uint32_t PHILOX_KEY_B = 0xBB67AE85u;
+  const uint32_t PHILOX_ROUND_A = 0xD2511F53u;
+  const uint32_t PHILOX_ROUND_B = 0xCD9E8D57u;
+  #pragma unroll
+  for (int r = 0; r < N_ROUNDS; ++r) {
+    const uint32_t _c0 = c0;
+    const uint32_t _c2 = c2;
+    const uint32_t hi0 = __umulhi(PHILOX_ROUND_A, _c0);
+    const uint32_t hi1 = __umulhi(PHILOX_ROUND_B, _c2);
+    const uint32_t lo0 = (uint32_t)(PHILOX_ROUND_A * _c0);
+    const uint32_t lo1 = (uint32_t)(PHILOX_ROUND_B * _c2);
+    c0 = hi1 ^ c1 ^ k0;
+    c2 = hi0 ^ c3 ^ k1;
+    c1 = lo1;
+    c3 = lo0;
+    k0 += PHILOX_KEY_A;
+    k1 += PHILOX_KEY_B;
+  }
+  return c0;
+}
+
+struct intentir_uint4 {
+  uint32_t x;
+  uint32_t y;
+  uint32_t z;
+  uint32_t w;
+};
+
+// Compute 4 independent Philox32 RNG outputs for counters:
+//   c0_base + {0,1,2,3}
+// This preserves the per-element mapping of `intentir_philox_randint_u32_rounds(seed, c0)`,
+// but reduces overhead vs calling it 4x by sharing the key schedule updates.
+template <int N_ROUNDS>
+__device__ __forceinline__ intentir_uint4 intentir_philox_randint4_u32_rounds(uint64_t seed, uint32_t c0_base) {
+  static_assert(N_ROUNDS > 0 && N_ROUNDS <= 10, "intentir_philox_randint4_u32_rounds supports 1..10 rounds");
+  // Use scalar lanes instead of small arrays: this typically compiles to fewer
+  // local-memory accesses and gives NVCC more room for register allocation /
+  // instruction scheduling (important for RNG-heavy kernels like dropout).
+  uint32_t c0_0 = c0_base;
+  uint32_t c0_1 = c0_base + 1u;
+  uint32_t c0_2 = c0_base + 2u;
+  uint32_t c0_3 = c0_base + 3u;
+  uint32_t c1_0 = 0u, c1_1 = 0u, c1_2 = 0u, c1_3 = 0u;
+  uint32_t c2_0 = 0u, c2_1 = 0u, c2_2 = 0u, c2_3 = 0u;
+  uint32_t c3_0 = 0u, c3_1 = 0u, c3_2 = 0u, c3_3 = 0u;
+  uint32_t k0 = (uint32_t)(seed & 0xFFFFFFFFu);
+  uint32_t k1 = (uint32_t)((seed >> 32) & 0xFFFFFFFFu);
+  const uint32_t PHILOX_KEY_A = 0x9E3779B9u;
+  const uint32_t PHILOX_KEY_B = 0xBB67AE85u;
+  const uint32_t PHILOX_ROUND_A = 0xD2511F53u;
+  const uint32_t PHILOX_ROUND_B = 0xCD9E8D57u;
+
+#define INTENTIR_PHILOX_ROUND_STEP(c0, c1, c2, c3)           \
+  do {                                                      \
+    const uint32_t hi0 = __umulhi(PHILOX_ROUND_A, (c0));     \
+    const uint32_t hi1 = __umulhi(PHILOX_ROUND_B, (c2));     \
+    const uint32_t lo0 = (uint32_t)(PHILOX_ROUND_A * (c0));  \
+    const uint32_t lo1 = (uint32_t)(PHILOX_ROUND_B * (c2));  \
+    (c0) = hi1 ^ (c1) ^ k0;                                  \
+    (c2) = hi0 ^ (c3) ^ k1;                                  \
+    (c1) = lo1;                                              \
+    (c3) = lo0;                                              \
+  } while (0)
+
+  #pragma unroll
+  for (int r = 0; r < N_ROUNDS; ++r) {
+    INTENTIR_PHILOX_ROUND_STEP(c0_0, c1_0, c2_0, c3_0);
+    INTENTIR_PHILOX_ROUND_STEP(c0_1, c1_1, c2_1, c3_1);
+    INTENTIR_PHILOX_ROUND_STEP(c0_2, c1_2, c2_2, c3_2);
+    INTENTIR_PHILOX_ROUND_STEP(c0_3, c1_3, c2_3, c3_3);
+    k0 += PHILOX_KEY_A;
+    k1 += PHILOX_KEY_B;
+  }
+
+#undef INTENTIR_PHILOX_ROUND_STEP
+
+  return intentir_uint4{c0_0, c0_1, c0_2, c0_3};
+}
+
+__device__ __forceinline__ uint32_t intentir_philox_randint_u32(uint64_t seed, uint32_t c0, int n_rounds) {
+  uint32_t c1 = 0u, c2 = 0u, c3 = 0u;
+  uint32_t k0 = (uint32_t)(seed & 0xFFFFFFFFu);
+  uint32_t k1 = (uint32_t)((seed >> 32) & 0xFFFFFFFFu);
+  const uint32_t PHILOX_KEY_A = 0x9E3779B9u;
+  const uint32_t PHILOX_KEY_B = 0xBB67AE85u;
+  const uint32_t PHILOX_ROUND_A = 0xD2511F53u;
+  const uint32_t PHILOX_ROUND_B = 0xCD9E8D57u;
+  if (n_rounds <= 0) n_rounds = 10;
+  #pragma unroll
+  for (int r = 0; r < 10; ++r) {
+    if (r >= n_rounds) break;
+    const uint32_t _c0 = c0;
+    const uint32_t _c2 = c2;
+    const uint32_t hi0 = __umulhi(PHILOX_ROUND_A, _c0);
+    const uint32_t hi1 = __umulhi(PHILOX_ROUND_B, _c2);
+    const uint32_t lo0 = (uint32_t)(PHILOX_ROUND_A * _c0);
+    const uint32_t lo1 = (uint32_t)(PHILOX_ROUND_B * _c2);
+    c0 = hi1 ^ c1 ^ k0;
+    c2 = hi0 ^ c3 ^ k1;
+    c1 = lo1;
+    c3 = lo0;
+    k0 += PHILOX_KEY_A;
+    k1 += PHILOX_KEY_B;
+  }
+  return c0;
+}
+
+__device__ __forceinline__ float intentir_uint_to_uniform_float_u32(uint32_t x) {
+  // Uniform float in [0, 1). Mirrors the "signed int then abs-ish" mapping used by RVV runtime.
+  int32_t xi = (int32_t)x;
+  // Branchless: if sign bit set, invert (~x); else keep x.
+  xi ^= (xi >> 31);
+  return (float)xi * 4.6566127342e-10f;
+}

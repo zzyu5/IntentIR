@@ -1,0 +1,15 @@
+passes:
+  - python:backend_legalize
+  - python:attach_provider_meta
+  - python:apply_tuning_db
+  - python:lower_intent_to_cuda_gpu_kernel
+  - mlir-opt:verify-each canonicalize cse nvgpu-optimize-shared-memory convert-scf-to-cf convert-gpu-to-nvvm convert-nvgpu-to-nvvm convert-arith-to-llvm convert-math-to-llvm convert-vector-to-llvm convert-index-to-llvm convert-func-to-llvm finalize-memref-to-llvm convert-cf-to-llvm reconcile-unrealized-casts
+  - python:extract_gpu_module_llvm
+  - python:rewrite_cuda_nv_exp2f_calls
+  - mlir-translate:mlir-to-llvmir
+  - python:ensure_llvm_ir_text
+  - "llvm-as:"
+  # Target-independent opt is safe for NVPTX in practice (the CUDA toolchain
+  # does it by default), and is required to get competitive performance for
+  # the real-MLIR PTX lane.
+  - "opt:-O3"

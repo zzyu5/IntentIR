@@ -1,0 +1,91 @@
+"""
+CUDA frontend full pipeline runner (Tasks 1–5, CUDA route).
+
+This is intentionally thin; the orchestration lives in `pipeline/cuda/core.py`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from pipeline.cuda.core import coverage_kernel_specs, default_kernel_specs, run_pipeline_for_spec
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kernel", action="append", default=None, help="Run a single kernel by name (repeatable)")
+    ap.add_argument("--suite", choices=["smoke", "coverage"], default="smoke")
+    ap.add_argument("--list", action="store_true", help="List available kernels and exit")
+    ap.add_argument("--cases-limit", type=int, default=8)
+    ap.add_argument("--backend-target", choices=["rvv", "cuda_h100", "cuda_5090d"], default=None)
+    default_llm = str(os.getenv("INTENTIR_USE_LLM", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    ap.add_argument(
+        "--llm",
+        action=argparse.BooleanOptionalAction,
+        default=default_llm,
+        help="Use LLM to lift CUDA descriptor to IntentIR (disable for deterministic coverage).",
+    )
+    ap.add_argument(
+        "--stage-c",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Stage C verification (metamorphic/bounded/numerical stability).",
+    )
+    ap.add_argument(
+        "--mutation-kill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable mutation-kill verification (very expensive).",
+    )
+    ap.add_argument("--out-dir", type=str, default=None)
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir) if args.out_dir else (ROOT / "artifacts" / "cuda_full_pipeline")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    suites = {
+        "smoke": default_kernel_specs,
+        "coverage": coverage_kernel_specs,
+    }
+    specs = list(suites[str(args.suite)]())
+
+    if args.list:
+        for s in specs:
+            print(s.name)
+        return
+    wanted = set(args.kernel or [])
+
+    for spec in specs:
+        if wanted and spec.name not in wanted:
+            continue
+        print(f"\n=== {spec.name} ===")
+        try:
+            report = run_pipeline_for_spec(
+                spec,
+                out_dir=out_dir,
+                cases_limit=int(args.cases_limit),
+                backend_target=(str(args.backend_target) if args.backend_target else None),
+                stage_c=bool(args.stage_c),
+                mutation_kill=bool(args.mutation_kill),
+                use_llm=bool(args.llm),
+            )
+        except Exception as e:
+            print("Pipeline failed:", e)
+            continue
+        out_path = out_dir / f"{spec.name}.json"
+        out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        diff_ok = bool((report.get("diff") or {}).get("ok"))
+        contract_level = (report.get("contract") or {}).get("level")
+        print(f"Report: {out_path} | contract={contract_level} diff={'OK' if diff_ok else 'FAIL'}")
+
+
+if __name__ == "__main__":
+    main()

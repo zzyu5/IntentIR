@@ -1,0 +1,160 @@
+#include "intentir_driver.h"
+
+static int intentir_write_bytes(const char* path, const void* src, size_t bytes) {
+  FILE* f = fopen(path, "wb");
+  if (!f) {
+    perror(path);
+    return 0;
+  }
+  size_t got = fwrite(src, 1, bytes, f);
+  fclose(f);
+  return got == bytes;
+}
+
+static int intentir_compare_i32(const char* name, const int32_t* got, const int32_t* ref, size_t n) {
+  size_t worst_i = 0;
+  int mismatch = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (got[i] != ref[i]) {
+      mismatch = 1;
+      worst_i = i;
+      break;
+    }
+  }
+  if (!mismatch) {
+    printf("%s: ok=1 max_abs=0 max_rel=0 worst_i=0 got=0 ref=0\n", name ? name : "out");
+    return 1;
+  }
+  printf(
+      "%s: ok=0 max_abs=1 max_rel=1 worst_i=%zu got=%d ref=%d\n",
+      name ? name : "out",
+      worst_i,
+      got[worst_i],
+      ref[worst_i]);
+  return 0;
+}
+
+static int intentir_compare_i64(const char* name, const int64_t* got, const int64_t* ref, size_t n) {
+  size_t worst_i = 0;
+  int mismatch = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (got[i] != ref[i]) {
+      mismatch = 1;
+      worst_i = i;
+      break;
+    }
+  }
+  if (!mismatch) {
+    printf("%s: ok=1 max_abs=0 max_rel=0 worst_i=0 got=0 ref=0\n", name ? name : "out");
+    return 1;
+  }
+  printf(
+      "%s: ok=0 max_abs=1 max_rel=1 worst_i=%zu got=%lld ref=%lld\n",
+      name ? name : "out",
+      worst_i,
+      (long long)got[worst_i],
+      (long long)ref[worst_i]);
+  return 0;
+}
+
+int intentir_alloc(IntentirBufferDesc* bufs, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    IntentirBufferDesc* b = &bufs[i];
+    if (!b->ptr) return 0;
+    if (b->bytes == 0) b->bytes = 1;
+    void* p = malloc(b->bytes);
+    if (!p) {
+      fprintf(stderr, "alloc failed: %s bytes=%zu\n", (b->name ? b->name : "(null)"), b->bytes);
+      return 0;
+    }
+    *b->ptr = p;
+  }
+  return 1;
+}
+
+int intentir_alloc_and_load_inputs(IntentirBufferDesc* inputs, size_t n) {
+  if (!intentir_alloc(inputs, n)) return 0;
+  for (size_t i = 0; i < n; ++i) {
+    IntentirBufferDesc* b = &inputs[i];
+    if (!b->name || !b->ptr || !*b->ptr) return 0;
+    char path[512];
+    snprintf(path, sizeof(path), "%s.bin", b->name);
+    if (!intentir_read_bytes(path, *b->ptr, b->bytes)) return 0;
+  }
+  return 1;
+}
+
+int intentir_compare_outputs_with_refs(const IntentirBufferDesc* outputs, size_t n, float atol, float rtol) {
+  const char* dump_env = getenv("INTENTIR_DUMP_MISMATCH_OUTPUTS");
+  const int dump = (dump_env && *dump_env && atoi(dump_env) != 0);
+  int ok_all = 1;
+  for (size_t i = 0; i < n; ++i) {
+    const IntentirBufferDesc* b = &outputs[i];
+    if (!b->name || !b->ptr || !*b->ptr) return 0;
+    if (b->bytes == 0) return 0;
+    char path[512];
+    snprintf(path, sizeof(path), "%s_ref.bin", b->name);
+    void* ref = malloc(b->bytes);
+    if (!ref) {
+      fprintf(stderr, "alloc failed: %s_ref bytes=%zu\n", b->name, b->bytes);
+      return 0;
+    }
+    if (!intentir_read_bytes(path, ref, b->bytes)) {
+      free(ref);
+      return 0;
+    }
+    int ok = 0;
+    switch (b->dtype) {
+      case INTENTIR_DTYPE_U8:
+      case INTENTIR_DTYPE_I8:
+      case INTENTIR_DTYPE_I16:
+        ok = intentir_compare_u8(b->name, (const uint8_t*)(*b->ptr), (const uint8_t*)ref, b->bytes);
+        break;
+      case INTENTIR_DTYPE_I32:
+        ok = intentir_compare_i32(b->name, (const int32_t*)(*b->ptr), (const int32_t*)ref, b->bytes / sizeof(int32_t));
+        break;
+      case INTENTIR_DTYPE_I64:
+        ok = intentir_compare_i64(b->name, (const int64_t*)(*b->ptr), (const int64_t*)ref, b->bytes / sizeof(int64_t));
+        break;
+      case INTENTIR_DTYPE_F32:
+      default:
+        ok = intentir_compare_f32(b->name, (const float*)(*b->ptr), (const float*)ref, b->bytes / sizeof(float), atol, rtol);
+        break;
+    }
+    if (!ok) ok_all = 0;
+    if (!ok && dump) {
+      char out_path[512];
+      snprintf(out_path, sizeof(out_path), "%s_got.bin", b->name);
+      // Best-effort dump for debugging; never fail the run on dump errors.
+      (void)intentir_write_bytes(out_path, *b->ptr, b->bytes);
+    }
+    free(ref);
+  }
+  return ok_all;
+}
+
+void intentir_maybe_bench(IntentirComputeFn compute, double matmul_flops_total) {
+  if (!compute) return;
+  int bench_iters = 0;
+  int bench_warmup = 1;
+  unsigned long long bench_seed = 0ull;
+  const char* b = getenv("INTENTIR_BENCH_ITERS");
+  if (b) bench_iters = atoi(b);
+  const char* w = getenv("INTENTIR_BENCH_WARMUP");
+  if (w) bench_warmup = atoi(w);
+  const char* s = getenv("INTENTIR_BENCH_SEED");
+  if (s && *s) bench_seed = strtoull(s, NULL, 10);
+  if (bench_iters <= 0) return;
+  if (bench_warmup < 0) bench_warmup = 0;
+  for (int i = 0; i < bench_warmup; ++i) compute();
+  uint64_t t0 = intentir_now_ns();
+  for (int i = 0; i < bench_iters; ++i) compute();
+  uint64_t t1 = intentir_now_ns();
+  double ns_total = (double)(t1 - t0);
+  double ns_per_iter = ns_total / (double)bench_iters;
+  double gflops = (ns_per_iter > 0.0) ? (matmul_flops_total / ns_per_iter) : 0.0;
+  printf(
+      "INTENTIR_BENCH "
+      "{\"iters\":%d,\"warmup\":%d,\"seed\":%llu,\"ns_total\":%llu,\"ns_per_iter\":%.1f,\"matmul_flops\":%.0f,\"matmul_gflops\":%.6f}\n",
+      bench_iters, bench_warmup, bench_seed, (unsigned long long)(t1 - t0), ns_per_iter, matmul_flops_total, gflops);
+}

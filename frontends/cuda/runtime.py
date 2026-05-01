@@ -1,0 +1,1627 @@
+"""
+CUDA baseline runtime runner (MVP).
+
+We implement baseline execution via a tiny Torch CUDA extension compiled at
+runtime (torch.utils.cpp_extension.load_inline). This keeps dependencies to
+only torch+nvcc (CuPy/cuda-python not required).
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import hashlib
+import inspect
+import os
+import re
+import shutil
+import sys
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+
+# Avoid MKL/OpenMP threading-layer conflicts when importing torch after numpy in
+# some environments (torch is imported lazily by this module).
+os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+
+import numpy as np
+
+
+class CudaRuntimeError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class CudaLaunch:
+    grid: Tuple[int, int, int]
+    block: Tuple[int, int, int]
+    shared_mem: int = 0
+
+
+def _ptx_entry_param_count(*, ptx_text: str, entry: str) -> int:
+    text = str(ptx_text or "")
+    wanted = str(entry or "").strip()
+    if not text.strip() or not wanted:
+        return 0
+    m = re.search(rf"\.visible\s+\.entry\s+{re.escape(wanted)}\s*\((.*?)\)\s*\{{", text, re.S)
+    if m is None:
+        return 0
+    sig = str(m.group(1) or "")
+    return int(len(re.findall(r"\.param\s+\.[A-Za-z0-9_]+(?:\s+\.ptr\s+\.[A-Za-z0-9_]+\s+\.align\s+\d+)?\s+[A-Za-z_.$][\w.$]*", sig)))
+
+
+def _infer_ptx_tensor_abi(*, io_spec: Mapping[str, Any], ptx_text: str, entry: str) -> str:
+    arg_names = [str(x) for x in list(io_spec.get("arg_names") or []) if str(x).strip()]
+    tensors = io_spec.get("tensors") if isinstance(io_spec.get("tensors"), Mapping) else {}
+    if not arg_names or not isinstance(tensors, Mapping):
+        return "raw_pointer"
+    param_count = _ptx_entry_param_count(ptx_text=ptx_text, entry=entry)
+    if param_count <= 0:
+        return "raw_pointer"
+    raw_count = int(len(arg_names))
+    flat_memref_count = 0
+    for name in arg_names:
+        flat_memref_count += 5 if str(name) in tensors else 1
+    if param_count == flat_memref_count and flat_memref_count != raw_count:
+        return "flat_rank1_memref"
+    return "raw_pointer"
+
+
+def _torch() -> Any:
+    import torch  # noqa: PLC0415
+
+    return torch
+
+
+def _cuda_free_mem_mb() -> int:
+    """
+    Best-effort free CUDA memory query.
+
+    This can fail if the CUDA context cannot be created (e.g., GPU OOM); in that
+    case we return 0 so callers can surface a clearer error early.
+    """
+    torch = _torch()
+    try:
+        if not torch.cuda.is_available():
+            return 0
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        free, _total = torch.cuda.mem_get_info()
+        return int(free // (1024 * 1024))
+    except Exception:
+        return 0
+
+
+def _min_free_mem_mb() -> int:
+    import os  # noqa: PLC0415
+
+    # Default to disabled. Some environments run large GPU workloads (e.g. vLLM)
+    # but still have enough headroom for tiny baseline kernels.
+    raw = os.getenv("INTENTIR_CUDA_MIN_FREE_MB", "0")
+    try:
+        v = int(raw)
+    except Exception:
+        v = 0
+    return max(0, v)
+
+
+def _try_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _base_expr_binding(bindings: Mapping[str, Any], *, base: str) -> int | None:
+    # Heuristic for symbolic keys like "N + 3" emitted by shape materialization.
+    pat = re.compile(rf"^{re.escape(str(base))}\s*\+\s*\d+$")
+    out: list[int] = []
+    for k, v in dict(bindings or {}).items():
+        key = str(k).strip()
+        if not key or not pat.match(key):
+            continue
+        iv = _try_int(v)
+        if iv is not None:
+            out.append(iv)
+    if not out:
+        return None
+    return int(max(out))
+
+
+def _augment_scalar_bindings_from_io_spec(
+    *,
+    bindings: Mapping[str, Any],
+    io_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    out = dict(bindings or {})
+    scalars = io_spec.get("scalars") if isinstance(io_spec.get("scalars"), Mapping) else {}
+    if not isinstance(scalars, Mapping) or not scalars:
+        return out
+
+    def _has_binding(name: str) -> bool:
+        if name not in out:
+            return False
+        value = out.get(name)
+        if value is None:
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+        return True
+
+    def _set_if_missing(name: str, value: Any) -> None:
+        if _has_binding(name):
+            return
+        iv = _try_int(value)
+        if iv is not None:
+            out[name] = int(iv)
+
+    _set_if_missing("M0", out.get("M"))
+    _set_if_missing("M1", out.get("M"))
+    _set_if_missing("N0", out.get("N"))
+    _set_if_missing("N1", out.get("N"))
+    _set_if_missing("M_OUT", out.get("M_OUT"))
+    _set_if_missing("N_OUT", out.get("N_OUT"))
+    if not _has_binding("M_OUT"):
+        _set_if_missing("M_OUT", _base_expr_binding(out, base="M"))
+    if not _has_binding("N_OUT"):
+        _set_if_missing("N_OUT", _base_expr_binding(out, base="N"))
+    _set_if_missing("M_OUT", out.get("M"))
+    _set_if_missing("N_OUT", out.get("N"))
+
+    if "T" in scalars and not _has_binding("T"):
+        m_out = _try_int(out.get("M_OUT"))
+        n_out = _try_int(out.get("N_OUT"))
+        m = _try_int(out.get("M"))
+        n = _try_int(out.get("N"))
+        l = _try_int(out.get("L"))
+        if m_out is not None and n_out is not None:
+            out["T"] = int(m_out * n_out)
+        elif m is not None and n_out is not None:
+            out["T"] = int(m * n_out)
+        elif m is not None and n is not None:
+            out["T"] = int(m * n)
+        elif l is not None and n is not None:
+            out["T"] = int(l * n)
+        elif n_out is not None:
+            out["T"] = int(n_out)
+        elif n is not None:
+            out["T"] = int(n)
+
+    for name in [str(k) for k in scalars.keys()]:
+        if _has_binding(name):
+            continue
+        m = re.match(r"^([A-Za-z_]+)\d+$", name)
+        if m is not None:
+            base = str(m.group(1))
+            if base in out:
+                _set_if_missing(name, out.get(base))
+    return out
+
+
+def _dtype_to_torch(dt: str):
+    torch = _torch()
+    s = str(dt)
+    if s == "f16":
+        return torch.float16
+    if s == "f32":
+        return torch.float32
+    if s == "bf16":
+        return torch.bfloat16
+    if s == "i8":
+        return torch.int8
+    if s == "i16":
+        return torch.int16
+    if s == "i32":
+        return torch.int32
+    if s == "i64":
+        return torch.int64
+    if s == "u8":
+        return torch.uint8
+    if s in {"bool", "i1"}:
+        return torch.bool
+    raise CudaRuntimeError(f"unsupported dtype for CUDA runtime: {dt}")
+
+
+def _c_type(dt: str) -> str:
+    s = str(dt)
+    if s == "f16":
+        return "__half"
+    if s == "f32":
+        return "float"
+    if s == "bf16":
+        return "__nv_bfloat16"
+    if s == "i8":
+        return "int8_t"
+    if s == "i16":
+        return "int16_t"
+    if s == "i32":
+        return "int"
+    if s == "i64":
+        return "int64_t"
+    if s == "u8":
+        return "uint8_t"
+    if s in {"bool", "i1"}:
+        return "bool"
+    raise CudaRuntimeError(f"unsupported dtype for CUDA runtime: {dt}")
+
+
+def _hash_src(text: str) -> str:
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_cuda_compile_flags(extra_cuda_cflags: Optional[Iterable[str]] = None) -> tuple[str, ...]:
+    flags_list = ["-O3"]
+    raw_fast_math = os.getenv("INTENTIR_CUDA_USE_FAST_MATH", "0").strip().lower()
+    if raw_fast_math in {"1", "true", "yes", "y"}:
+        flags_list.append("--use_fast_math")
+    for x in (extra_cuda_cflags or []):
+        s = str(x).strip()
+        if s:
+            flags_list.append(s)
+    seen: set[str] = set()
+    return tuple(s for s in flags_list if not (s in seen or seen.add(s)))
+
+
+def _default_torch_ext_root() -> Path:
+    """
+    Default Torch extension build root under the repo.
+
+    Some sandboxed environments forbid writing to `~/.cache/torch_extensions`.
+    Keeping build outputs under `artifacts/` also makes runs reproducible.
+    """
+    root = Path(__file__).resolve().parents[2]
+    py_tag = f"py{sys.version_info.major}{sys.version_info.minor}"
+    return root / "artifacts" / "torch_extensions" / py_tag
+
+
+def _torch_ext_build_dir(name: str) -> Path:
+    base = os.getenv("INTENTIR_TORCH_EXT_DIR")
+    if base:
+        return Path(base) / str(name)
+    return _default_torch_ext_root() / str(name)
+
+
+def _maybe_add_python_ninja_to_path() -> None:
+    """
+    Best-effort fix for environments where the `ninja` Python package is installed,
+    but the `ninja` executable isn't on PATH (common on SSH clusters).
+    """
+    if shutil.which("ninja"):
+        return
+    try:
+        import ninja  # type: ignore[import-not-found]  # noqa: PLC0415
+
+        bin_dir = getattr(ninja, "BIN_DIR", None)
+        if not bin_dir:
+            return
+        bd = Path(str(bin_dir))
+        if not bd.is_dir():
+            return
+        cur = os.environ.get("PATH", "")
+        parts = [p for p in cur.split(os.pathsep) if p]
+        if str(bd) in parts:
+            return
+        os.environ["PATH"] = str(bd) + os.pathsep + cur
+    except Exception:
+        return
+
+
+def _maybe_set_cuda_home_for_hopper() -> None:
+    """
+    Best-effort fix for H100-class GPUs where `nvcc` on PATH is too old (e.g., CUDA 11.x),
+    but a newer toolkit is installed under `/usr/local/cuda-*`.
+
+    PyTorch's extension builder shells out to `nvcc`; if it picks an old one, builds fail with:
+      `nvcc fatal: Unsupported gpu architecture 'compute_90'`.
+    """
+    if os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH") or os.getenv("CUDACXX"):
+        return
+    if os.name != "posix":
+        return
+    torch = _torch()
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+    except Exception:
+        return
+    if int(major) < 9:
+        return
+
+    cuda_root = Path("/usr/local")
+    if not cuda_root.is_dir():
+        return
+
+    def _parse_cuda_ver(p: Path) -> tuple[int, int] | None:
+        name = p.name
+        if name == "cuda":
+            return None
+        if not name.startswith("cuda-"):
+            return None
+        raw = name[len("cuda-") :]
+        parts = raw.split(".")
+        try:
+            major_v = int(parts[0])
+            minor_v = int(parts[1]) if len(parts) > 1 else 0
+        except Exception:
+            return None
+        return (major_v, minor_v)
+
+    candidates: list[tuple[tuple[int, int], Path]] = []
+    for p in cuda_root.glob("cuda-*"):
+        nvcc = p / "bin" / "nvcc"
+        ver = _parse_cuda_ver(p)
+        if ver is None or not nvcc.is_file():
+            continue
+        candidates.append((ver, p))
+
+    # Also consider `/usr/local/cuda` (often a symlink to the active toolkit).
+    cuda_symlink = cuda_root / "cuda"
+    if cuda_symlink.is_dir() and (cuda_symlink / "bin" / "nvcc").is_file():
+        # Give it a lower priority unless it points to a versioned dir.
+        candidates.append(((0, 0), cuda_symlink))
+
+    if not candidates:
+        return
+
+    # Pick the highest versioned toolkit; fall back to `/usr/local/cuda` if no version parsed.
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    chosen = candidates[0][1]
+    os.environ["CUDA_HOME"] = str(chosen)
+    os.environ["CUDACXX"] = str(chosen / "bin" / "nvcc")
+    cuda_bin = str(chosen / "bin")
+    if cuda_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+def _intentir_cuda_include_dirs() -> list[str]:
+    """
+    Include directories for IntentIR-generated CUDA kernels.
+
+    This lets kernels `#include` our small runtime headers (e.g., Philox RNG)
+    without embedding them as giant strings in each generated kernel.
+    """
+    root = Path(__file__).resolve().parents[2]
+    dirs: list[Path] = [
+        root / "backends" / "cuda" / "runtime",
+    ]
+    out: list[str] = []
+    for d in dirs:
+        if d.is_dir():
+            out.append(str(d))
+    return out
+
+
+def _nvrtc_cuda_include_dirs() -> list[str]:
+    """
+    Best-effort CUDA include directories for NVRTC fallback compilation.
+
+    When a machine has an NVIDIA driver but no full CUDA toolkit (no `nvcc`),
+    PyTorch's C++ extension JIT cannot build our kernels. In that case we can
+    compile device code with NVRTC, as long as CUDA headers are available.
+
+    Newer PyTorch wheels often pull CUDA headers via pip packages (e.g.
+    `nvidia-cuda-runtime-cu12`, `nvidia-cuda-nvcc-cu12`). We probe those well-
+    known locations, but keep this function permissive: missing dirs are fine.
+    """
+    try:
+        import importlib.util  # noqa: PLC0415
+    except Exception:
+        return []
+
+    roots: list[Path] = []
+    for mod in ("nvidia.cuda_runtime", "nvidia.cuda_nvcc", "triton"):
+        try:
+            spec = importlib.util.find_spec(mod)
+        except Exception:
+            spec = None
+        if spec is None or not spec.origin:
+            continue
+        p = Path(spec.origin).resolve()
+        # mod is .../site-packages/nvidia/cuda_runtime/__init__.py
+        if p.parent.name in {"cuda_runtime", "cuda_nvcc"}:
+            roots.append(p.parent.parent)  # .../site-packages/nvidia
+        elif p.parent.name == "triton":
+            roots.append(p.parent)  # .../site-packages/triton
+
+    cands: list[Path] = []
+    for r in roots:
+        # pip CUDA headers
+        cands.append(r / "cuda_runtime" / "include")
+        cands.append(r / "cuda_nvcc" / "include")
+        # Triton ships a minimal CUDA header subset (enough for mma.h, fp16/bf16).
+        cands.append(r / "backends" / "nvidia" / "include")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in cands:
+        if d.is_dir():
+            s = str(d)
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
+
+
+def _has_working_nvcc() -> bool:
+    cuda_home = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH") or ""
+    if cuda_home:
+        nvcc = Path(cuda_home) / "bin" / "nvcc"
+        if nvcc.is_file():
+            return True
+    return shutil.which("nvcc") is not None
+
+
+def _nvrtc_system_include_dirs() -> list[str]:
+    """
+    Host system include paths for NVRTC.
+
+    NVRTC needs access to libc/libstdc++ headers for common includes like
+    <stddef.h>, <stdint.h>, <math.h>, <cstdio>, etc. On driver-only machines
+    these still exist under /usr/include and /usr/include/c++/*.
+    """
+    cands: list[Path] = []
+    for p in (
+        Path("/usr/include"),
+        Path("/usr/local/include"),
+        Path("/usr/include/x86_64-linux-gnu"),
+    ):
+        cands.append(p)
+
+    cxx_root = Path("/usr/include/c++")
+    if cxx_root.is_dir():
+        for sub in sorted(cxx_root.iterdir()):
+            if not sub.is_dir():
+                continue
+            cands.append(sub)
+            # Some distros use an arch subdir.
+            cands.append(sub / "x86_64-linux-gnu")
+            # Debian/Ubuntu-style multiarch libstdc++ headers.
+            cands.append(Path("/usr/include/x86_64-linux-gnu/c++") / sub.name)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in cands:
+        if d.is_dir():
+            s = str(d)
+            if s not in seen:
+                out.append(s)
+                seen.add(s)
+    return out
+
+
+def _nvrtc_shim_include_dir() -> str | None:
+    """
+    Extra include directory for NVRTC to paper over distro/header mismatches.
+
+    This is intentionally minimal and only used for the NVRTC fallback path.
+    """
+    root = Path(__file__).resolve().parents[2]
+    d = root / "backends" / "cuda" / "runtime" / "nvrtc_shim"
+    return str(d) if d.is_dir() else None
+
+
+def _normalize_nvrtc_arch(raw: str) -> str:
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    if s.startswith("compute_"):
+        digits = "".join(ch for ch in s[len("compute_") :] if ch.isdigit())
+        return f"compute_{digits}" if digits else ""
+    if s.startswith("sm_"):
+        s = s[3:]
+    elif s.startswith("sm"):
+        s = s[2:]
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return f"compute_{digits}" if digits else ""
+
+
+def _nvrtc_auto_compat_arch(major: int, minor: int) -> str:
+    """
+    Choose a conservative NVRTC target for very new GPUs.
+
+    Some local toolchains lag behind the newest SM versions (e.g. sm_120),
+    while the driver can still JIT older PTX targets (e.g. compute_90).
+    """
+    env_compat = _normalize_nvrtc_arch(os.getenv("INTENTIR_CUDA_NVRTC_COMPAT_ARCH", ""))
+    if env_compat:
+        return env_compat
+    mj = int(major)
+    mn = int(minor)
+    if mj >= 12:
+        return "compute_90"
+    if mj > 0:
+        return f"compute_{mj}{mn}"
+    return "compute_80"
+
+
+def _resolve_nvrtc_arch(torch: Any) -> str:
+    env_arch = _normalize_nvrtc_arch(os.getenv("INTENTIR_CUDA_NVRTC_ARCH", ""))
+    if env_arch:
+        return env_arch
+    env_sm = _normalize_nvrtc_arch(os.getenv("INTENTIR_CUDA_SM", ""))
+    if env_sm:
+        return env_sm
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        major, minor = (0, 0)
+    return _nvrtc_auto_compat_arch(int(major), int(minor))
+
+
+def _normalize_extra_include_dirs(extra_include_dirs: Optional[Iterable[str | Path]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in list(extra_include_dirs or []):
+        p = Path(str(x)).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        if not p.is_dir():
+            continue
+        s = str(p)
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _nvrtc_compile_ptx(
+    *,
+    cuda_src: str,
+    prog_name: str,
+    extra_cuda_cflags: Tuple[str, ...],
+    extra_include_dirs: Optional[Iterable[str | Path]] = None,
+) -> bytes:
+    """
+    Compile CUDA device code to PTX via NVRTC (no nvcc / CUDA toolkit required).
+
+    This is a fallback for environments where torch's JIT extension build can't
+    find `nvcc` (e.g. driver-only machines).
+    """
+    torch = _torch()
+    if not torch.cuda.is_available():
+        raise CudaRuntimeError("torch.cuda is not available; cannot NVRTC-compile CUDA kernels")
+
+    # Ensure a CUDA context exists before using the driver API.
+    try:
+        torch.empty((1,), device="cuda")
+    except Exception:
+        pass
+
+    try:
+        try:
+            from cuda import nvrtc  # type: ignore[attr-defined]  # noqa: PLC0415
+        except Exception:
+            from cuda.bindings import nvrtc  # type: ignore[assignment]  # noqa: PLC0415
+    except Exception as e:
+        raise CudaRuntimeError(
+            "NVRTC fallback requested, but cuda-python (cuda-bindings) is not available. "
+            "Install a CUDA-enabled torch wheel (which typically depends on cuda-bindings), "
+            "or install `cuda-bindings` explicitly."
+        ) from e
+
+    arch = _resolve_nvrtc_arch(torch)
+
+    # NVRTC option support varies by version; keep the baseline flags minimal.
+    opts: list[bytes] = [b"--std=c++17", f"--gpu-architecture={arch}".encode("utf-8")]
+    # Translate a small subset of nvcc flags to NVRTC equivalents.
+    for f in extra_cuda_cflags:
+        if f == "--use_fast_math":
+            opts.append(b"--use_fast_math")
+
+    shim = _nvrtc_shim_include_dir()
+    include_dirs: list[str] = []
+    if shim:
+        include_dirs.append(shim)
+    # Avoid adding host system include paths by default: glibc/libstdc++ headers
+    # are not device-annotated and often fail under NVRTC's device compilation
+    # mode. We provide a tiny shim (nvrtc_shim/) for the few std headers we use.
+    include_dirs += [*_intentir_cuda_include_dirs(), *_nvrtc_cuda_include_dirs()]
+    include_dirs += _normalize_extra_include_dirs(extra_include_dirs)
+    seen_includes: set[str] = set()
+    for inc in include_dirs:
+        s = str(inc).strip()
+        if not s or s in seen_includes:
+            continue
+        seen_includes.add(s)
+        opts.append(f"--include-path={inc}".encode("utf-8"))
+
+    # NVRTC runs in device compilation mode: strip host-only helpers that may be
+    # present in nvcc-built modules (e.g., variant/dispatch introspection globals).
+    drop_exact = {
+        "#include <cstdlib>",
+        "#include <cstdio>",
+        "#include <cuda.h>",
+        "#include <cuda_runtime.h>",
+    }
+    drop_substrings = (
+        "intentir_cuda_selected_variant",
+        "intentir_cuda_selected_tag",
+        "intentir_cuda_selected_variant_idx",
+        "intentir_cuda_selected_variant_tag",
+        "intentir_cuda_variant_count",
+        "intentir_cuda_dispatch_total_ms",
+        "intentir_cuda_dispatch_evals",
+        "intentir_cuda_get_dispatch_total_ms",
+        "intentir_cuda_get_dispatch_evals",
+        "intentir_cuda_has_evidence",
+        "intentir_cuda_contract_level",
+        "intentir_cuda_specialize_dims",
+        "intentir_cuda_fastpath_enabled",
+        "intentir_cuda_get_fastpath_enabled",
+    )
+    out_lines: list[str] = []
+    src_text = str(cuda_src)
+    for line in src_text.splitlines():
+        s = line.strip()
+        if s in drop_exact:
+            continue
+        if any(token in line for token in drop_substrings):
+            continue
+        out_lines.append(line)
+    # Some generated kernels rely on int64_t but don't include stdint themselves.
+    # NVCC wrapper path injects this include automatically; keep NVRTC behavior aligned.
+    if not any("#include <stdint.h>" in line or "#include <cstdint>" in line for line in out_lines):
+        out_lines.insert(0, "#include <stdint.h>")
+    src_bytes = ("\n".join(out_lines) + "\n").encode("utf-8")
+    name_bytes = str(prog_name).encode("utf-8")
+    err, prog = nvrtc.nvrtcCreateProgram(src_bytes, name_bytes, 0, None, None)
+    if int(err) != 0:
+        raise CudaRuntimeError(f"nvrtcCreateProgram failed: {err}")
+
+    (err,) = nvrtc.nvrtcCompileProgram(prog, int(len(opts)), opts)
+    if int(err) != 0:
+        try:
+            err2, log_size = nvrtc.nvrtcGetProgramLogSize(prog)
+            (void_err2,) = (err2,)  # noqa: F841
+            log = bytearray(int(log_size))
+            nvrtc.nvrtcGetProgramLog(prog, log)
+            log_text = bytes(log).decode("utf-8", errors="replace")
+        except Exception:
+            log_text = ""
+        raise CudaRuntimeError(f"NVRTC compile failed ({err}).\n{log_text}")
+
+    err, ptx_size = nvrtc.nvrtcGetPTXSize(prog)
+    if int(err) != 0:
+        raise CudaRuntimeError(f"nvrtcGetPTXSize failed: {err}")
+    ptx_buf = bytearray(int(ptx_size))
+    (err,) = nvrtc.nvrtcGetPTX(prog, ptx_buf)
+    if int(err) != 0:
+        raise CudaRuntimeError(f"nvrtcGetPTX failed: {err}")
+    return bytes(ptx_buf)
+
+
+class _NvrtcCudaModule:
+    def __init__(
+        self,
+        *,
+        kernel_name: str,
+        cuda_src: str,
+        io_spec: Dict[str, Any],
+        extra_cuda_cflags: Tuple[str, ...],
+        ptx: bytes | str | None = None,
+        selected_tag: str = "nvrtc_direct",
+    ) -> None:
+        torch = _torch()
+        if bool(io_spec.get("host_launch")):
+            raise CudaRuntimeError(
+                "NVRTC fallback does not support host-dispatch kernels (io_spec.host_launch=true). "
+                "Re-run with CUDA_HOST_DISPATCH=0 to force direct-launch kernels."
+            )
+
+        # Ensure a CUDA context exists before using the driver API.
+        torch.empty((1,), device="cuda")
+
+        try:
+            try:
+                from cuda import cuda  # type: ignore[attr-defined]  # noqa: PLC0415
+            except Exception:
+                from cuda.bindings import driver as cuda  # type: ignore[assignment]  # noqa: PLC0415
+        except Exception as e:
+            raise CudaRuntimeError(
+                "NVRTC fallback requested, but CUDA driver bindings are unavailable "
+                "(expected cuda.cuda or cuda.bindings.driver)."
+            ) from e
+
+        (err,) = cuda.cuInit(0)
+        if int(err) != 0:
+            raise CudaRuntimeError(f"cuInit failed: {err}")
+
+        self._cuda = cuda
+        self._kernel_name = str(kernel_name)
+        self._io_spec = dict(io_spec)
+        self._selected_variant = -1
+        self._selected_tag = str(selected_tag or "nvrtc_direct")
+
+        ptx_payload: bytes
+        if ptx is None:
+            ptx_payload = _nvrtc_compile_ptx(cuda_src=cuda_src, prog_name=f"{kernel_name}.cu", extra_cuda_cflags=extra_cuda_cflags)
+        elif isinstance(ptx, bytes):
+            ptx_payload = ptx
+        else:
+            ptx_payload = str(ptx).encode("utf-8")
+        self._ptx_text = ptx_payload.decode("utf-8", errors="ignore")
+        self._tensor_abi = _infer_ptx_tensor_abi(
+            io_spec=self._io_spec,
+            ptx_text=self._ptx_text,
+            entry=self._kernel_name,
+        )
+        err, mod = cuda.cuModuleLoadData(ptx_payload)
+        if int(err) != 0:
+            raise CudaRuntimeError(f"cuModuleLoadData failed: {err}")
+        err, func = cuda.cuModuleGetFunction(mod, self._kernel_name.encode("utf-8"))
+        if int(err) != 0:
+            raise CudaRuntimeError(f"cuModuleGetFunction({self._kernel_name}) failed: {err}")
+        self._mod = mod
+        self._func = func
+
+        # Cache for dynamic shared memory attribute.
+        self._last_smem: int = -1
+        # Cache the last packed kernel-arg buffer so repeated eager launches of the
+        # same tensors/scalars avoid rebuilding ctypes wrappers every time.
+        self._last_arg_pack_key: tuple[Any, ...] | None = None
+        self._last_arg_pack_ptr: int = 0
+        self._last_arg_pack_storage: tuple[list[Any], Any] | None = None
+
+    def selected_variant(self) -> int:
+        return int(self._selected_variant)
+
+    def selected_tag(self) -> str:
+        return str(self._selected_tag)
+
+    def launch(self, *args: Any) -> None:
+        import ctypes  # noqa: PLC0415
+
+        torch = _torch()
+        if len(args) < 7:
+            raise CudaRuntimeError("nvrtc module launch: missing launch dims (grid/block/shared_mem)")
+
+        # Split kernel args vs launch dims.
+        grid_x, grid_y, grid_z, block_x, block_y, block_z, shared_mem = (int(x) for x in args[-7:])
+        call_args = list(args[:-7])
+
+        arg_names = self._io_spec.get("arg_names") if isinstance(self._io_spec.get("arg_names"), list) else []
+        arg_names = [str(x) for x in arg_names]
+        tensors = self._io_spec.get("tensors") if isinstance(self._io_spec.get("tensors"), dict) else {}
+        scalars = self._io_spec.get("scalars") if isinstance(self._io_spec.get("scalars"), dict) else {}
+
+        if len(call_args) != len(arg_names):
+            raise CudaRuntimeError(f"nvrtc module launch: expected {len(arg_names)} args, got {len(call_args)}")
+
+        packed_args: list[tuple[Any, ...]] = []
+        for name, v in zip(arg_names, call_args):
+            if name in tensors:
+                if not isinstance(v, torch.Tensor):
+                    raise CudaRuntimeError(f"nvrtc module launch: expected torch.Tensor for {name}")
+                if str(self._tensor_abi) == "flat_rank1_memref":
+                    ptr = int(v.data_ptr())
+                    numel = int(v.numel()) if int(v.dim()) > 0 else 1
+                    packed_args.append(("tensor_flat_rank1_memref", ptr, numel))
+                else:
+                    packed_args.append(("tensor_ptr", int(v.data_ptr())))
+                continue
+            if name in scalars:
+                dt = str(scalars[name])
+                if dt == "f32":
+                    packed_args.append(("scalar_f32", float(v)))
+                elif dt == "i32":
+                    packed_args.append(("scalar_i32", int(v)))
+                elif dt == "i64":
+                    packed_args.append(("scalar_i64", int(v)))
+                elif dt in {"bool", "i1"}:
+                    packed_args.append(("scalar_bool", bool(v)))
+                else:
+                    # Fallback: pass as int64.
+                    packed_args.append(("scalar_i64", int(v)))
+                continue
+            # Unknown arg: treat as int64.
+            packed_args.append(("scalar_i64", int(v)))
+
+        pack_key = tuple(packed_args)
+        arg_ptr_addr = int(self._last_arg_pack_ptr)
+        if self._last_arg_pack_key != pack_key or self._last_arg_pack_storage is None:
+            c_values: list[Any] = []
+            for desc in packed_args:
+                tag = str(desc[0])
+                if tag == "tensor_flat_rank1_memref":
+                    _, ptr, numel = desc
+                    c_values.extend(
+                        [
+                            ctypes.c_void_p(int(ptr)),
+                            ctypes.c_void_p(int(ptr)),
+                            ctypes.c_ulonglong(0),
+                            ctypes.c_ulonglong(int(numel)),
+                            ctypes.c_ulonglong(1),
+                        ]
+                    )
+                elif tag == "tensor_ptr":
+                    _, ptr = desc
+                    c_values.append(ctypes.c_void_p(int(ptr)))
+                elif tag == "scalar_f32":
+                    _, val = desc
+                    c_values.append(ctypes.c_float(float(val)))
+                elif tag == "scalar_i32":
+                    _, val = desc
+                    c_values.append(ctypes.c_int(int(val)))
+                elif tag == "scalar_i64":
+                    _, val = desc
+                    c_values.append(ctypes.c_longlong(int(val)))
+                elif tag == "scalar_bool":
+                    _, val = desc
+                    c_values.append(ctypes.c_bool(bool(val)))
+                else:
+                    raise CudaRuntimeError(f"nvrtc module launch: unsupported packed arg tag {tag}")
+
+            arg_ptrs = (ctypes.c_void_p * len(c_values))()
+            for i, cv in enumerate(c_values):
+                arg_ptrs[i] = ctypes.cast(ctypes.byref(cv), ctypes.c_void_p)
+            arg_ptr_addr = int(ctypes.addressof(arg_ptrs))
+            self._last_arg_pack_key = pack_key
+            self._last_arg_pack_ptr = arg_ptr_addr
+            self._last_arg_pack_storage = (c_values, arg_ptrs)
+
+        # Match the torch extension wrapper behavior: allow larger dynamic shared memory if needed.
+        if shared_mem >= 49152 and self._last_smem != int(shared_mem):
+            try:
+                attr = self._cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+                (err,) = self._cuda.cuFuncSetAttribute(self._func, attr, int(shared_mem))
+                if int(err) != 0:
+                    raise CudaRuntimeError(f"cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES,{shared_mem}) failed: {err}")
+                self._last_smem = int(shared_mem)
+            except Exception:
+                # Best-effort; some drivers may not support this attribute for all kernels.
+                self._last_smem = int(shared_mem)
+
+        stream = int(torch.cuda.current_stream().cuda_stream)
+        err = self._cuda.cuLaunchKernel(
+            self._func,
+            int(grid_x),
+            int(grid_y),
+            int(grid_z),
+            int(block_x),
+            int(block_y),
+            int(block_z),
+            int(shared_mem),
+            int(stream),
+            int(arg_ptr_addr),
+            0,
+        )
+        if isinstance(err, tuple):
+            err = err[0]
+        if int(err) != 0:
+            raise CudaRuntimeError(f"cuLaunchKernel failed: {err}")
+
+
+@lru_cache(maxsize=1)
+def _intentir_cuda_runtime_hash_payload() -> str:
+    """
+    Content hash payload for runtime headers included by generated kernels.
+
+    `load_inline` caches build products by module name; to ensure rebuilds when
+    a header changes, we incorporate the header text into our module hash.
+    """
+    root = Path(__file__).resolve().parents[2]
+    rt = root / "backends" / "cuda" / "runtime"
+    try:
+        if rt.is_dir():
+            parts: list[str] = []
+            for p in sorted(rt.rglob("*.cuh")):
+                try:
+                    rel = p.relative_to(root)
+                except Exception:
+                    rel = p
+                try:
+                    text = p.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                parts.append(f"\n// FILE: {rel}\n{text}")
+            if parts:
+                return "\n".join(parts)
+    except Exception:
+        return ""
+    return ""
+
+
+@lru_cache(maxsize=1)
+def _intentir_cuda_runner_hash_payload() -> str:
+    """
+    Content hash payload for Python-side CUDA extension wrapper generation.
+
+    Keep this payload narrowly scoped to wrapper ABI/build-surface helpers so
+    unrelated runtime.py edits do not invalidate all cached kernel modules.
+    """
+    abi_version = "runner_abi_v2"
+    parts: list[str] = [f"runner_abi={abi_version}"]
+    for fn in (_c_type, _build_extension_src):
+        try:
+            parts.append(inspect.getsource(fn))
+        except Exception:
+            parts.append(f"source_unavailable:{getattr(fn, '__name__', 'unknown')}")
+    return "\n".join(parts)
+
+
+def _build_extension_src(cuda_src: str, *, kernel_name: str, io_spec: Dict[str, Any]) -> str:
+    arg_names = io_spec.get("arg_names") if isinstance(io_spec.get("arg_names"), list) else []
+    arg_names = [str(x) for x in arg_names]
+    tensors = io_spec.get("tensors") if isinstance(io_spec.get("tensors"), dict) else {}
+    scalars = io_spec.get("scalars") if isinstance(io_spec.get("scalars"), dict) else {}
+    use_host_launch = bool(io_spec.get("host_launch"))
+    has_selected_api = ("intentir_cuda_selected_variant" in cuda_src) and ("intentir_cuda_selected_tag" in cuda_src)
+    has_variant_count_api = "intentir_cuda_variant_count" in cuda_src
+    has_dispatch_api = ("intentir_cuda_get_dispatch_total_ms" in cuda_src) and ("intentir_cuda_get_dispatch_evals" in cuda_src)
+    has_evidence_api = "intentir_cuda_has_evidence" in cuda_src
+    has_contract_api = "intentir_cuda_contract_level" in cuda_src
+    has_specialize_api = "intentir_cuda_specialize_dims" in cuda_src
+    has_fastpath_api = "intentir_cuda_get_fastpath_enabled" in cuda_src
+
+    # Build launch() signature: tensors as torch::Tensor, scalars as int64_t.
+    sig_args: list[str] = []
+    call_args: list[str] = []
+    checks: list[str] = []
+    ptr_decls: list[str] = []
+
+    for name in arg_names:
+        if name in tensors:
+            spec = tensors[name] if isinstance(tensors.get(name), dict) else {}
+            dt = str(spec.get("dtype") or "f32")
+            sig_args.append(f"torch::Tensor {name}")
+            checks += [
+                f"TORCH_CHECK({name}.is_cuda(), \"{name} must be CUDA tensor\");",
+                f"TORCH_CHECK({name}.is_contiguous(), \"{name} must be contiguous\");",
+            ]
+            # dtype check (minimal)
+            if dt == "f32":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kFloat, \"{name} must be float32\");")
+            elif dt == "bf16":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kBFloat16, \"{name} must be bfloat16\");")
+            elif dt == "f16":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kHalf, \"{name} must be float16\");")
+            elif dt == "u8":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kByte, \"{name} must be uint8\");")
+            elif dt == "i8":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kChar, \"{name} must be int8\");")
+            elif dt == "i16":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kShort, \"{name} must be int16\");")
+            elif dt == "i32":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kInt, \"{name} must be int32\");")
+            elif dt == "i64":
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kLong, \"{name} must be int64\");")
+            elif dt in {"bool", "i1"}:
+                checks.append(f"TORCH_CHECK({name}.scalar_type() == at::kBool, \"{name} must be bool\");")
+            cty = _c_type(dt)
+            ptr_decls.append(f"auto {name}_ptr = ({cty}*){name}.data_ptr();")
+            call_args.append(f"{name}_ptr")
+        elif name in scalars:
+            dt = str(scalars[name])
+            if dt == "f32":
+                sig_args.append(f"double {name}")
+                call_args.append(f"(float){name}")
+            else:
+                sig_args.append(f"int64_t {name}")
+                call_args.append(f"({ _c_type(dt) }){name}")
+        else:
+            # Unknown arg: treat as int64 scalar.
+            sig_args.append(f"int64_t {name}")
+            call_args.append(f"(int64_t){name}")
+
+    sig_args += [
+        "int64_t grid_x",
+        "int64_t grid_y",
+        "int64_t grid_z",
+        "int64_t block_x",
+        "int64_t block_y",
+        "int64_t block_z",
+        "int64_t shared_mem",
+    ]
+    dim = "dim3((unsigned)grid_x,(unsigned)grid_y,(unsigned)grid_z)"
+    bdim = "dim3((unsigned)block_x,(unsigned)block_y,(unsigned)block_z)"
+
+    host_call = ""
+    if use_host_launch:
+        host_param_types: list[str] = []
+        for name in arg_names:
+            if name in tensors:
+                spec = tensors[name] if isinstance(tensors.get(name), dict) else {}
+                dt = str(spec.get("dtype") or "f32")
+                host_param_types.append(f"{_c_type(dt)}*")
+            elif name in scalars:
+                dt = str(scalars[name])
+                if dt == "f32":
+                    host_param_types.append("float")
+                else:
+                    host_param_types.append(_c_type(dt))
+            else:
+                host_param_types.append("int64_t")
+        host_call = f"{kernel_name}_host_launch({', '.join([*call_args, 'grid_x', 'grid_y', 'grid_z', 'block_x', 'block_y', 'block_z', 'shared_mem', 'stream'])});"
+
+    selected_init = ""
+    if has_selected_api:
+        selected_init = 'intentir_cuda_selected_variant_idx = -1; intentir_cuda_selected_variant_tag = "direct_launch";'
+        if use_host_launch:
+            selected_init = 'intentir_cuda_selected_variant_idx = -1; intentir_cuda_selected_variant_tag = "host_launch";'
+
+    if use_host_launch:
+        launch_body = f"""
+  // Respect the current PyTorch CUDA stream (required for correct stream semantics,
+  // and for features like CUDA Graph capture).
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  {selected_init}
+  {host_call}
+""".rstrip()
+    else:
+        launch_body = f"""
+  // Respect the current PyTorch CUDA stream (required for correct stream semantics,
+  // and for features like CUDA Graph capture).
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  // Some high-performance kernels may opt into >48KiB shared memory (e.g., for
+  // multi-stage tensor-core pipelines). CUDA requires setting a per-kernel
+  // attribute to enable larger dynamic shared memory on GPUs that support it.
+  static const void* intentir_last_kernel = nullptr;
+  static int intentir_last_smem = -1;
+  const void* intentir_kernel_ptr = (const void*){kernel_name};
+    if (shared_mem >= 49152 && (intentir_last_kernel != intentir_kernel_ptr || intentir_last_smem != (int)shared_mem)) {{
+      cudaError_t err = cudaFuncSetAttribute(intentir_kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shared_mem);
+      TORCH_CHECK(err == cudaSuccess, "cudaFuncSetAttribute(MaxDynamicSharedMemorySize) failed: ", cudaGetErrorString(err));
+      intentir_last_kernel = intentir_kernel_ptr;
+      intentir_last_smem = (int)shared_mem;
+    }}
+  {selected_init}
+  {kernel_name}<<<{dim}, {bdim}, (size_t)shared_mem, stream>>>({", ".join(call_args)});
+""".rstrip()
+
+    selected_api = ""
+    if has_selected_api:
+        selected_api = """
+  m.def("selected_variant", []() { return (int64_t)intentir_cuda_selected_variant(); }, "Selected variant index");
+  m.def("selected_tag", []() {
+    const char* s = intentir_cuda_selected_tag();
+    return s ? std::string(s) : std::string();
+  }, "Selected variant tag");
+"""
+    if has_variant_count_api:
+        selected_api += """
+  m.def("variant_count", []() { return (int64_t)intentir_cuda_variant_count(); }, "Number of compiled variants (host dispatch search space)");
+"""
+    if has_dispatch_api:
+        selected_api += """
+  m.def("dispatch_total_ms", []() { return (double)intentir_cuda_get_dispatch_total_ms(); }, "Total selection microbench time in milliseconds");
+  m.def("dispatch_evals", []() { return (int64_t)intentir_cuda_get_dispatch_evals(); }, "Number of candidates evaluated during selection");
+"""
+    if has_evidence_api:
+        selected_api += """
+  m.def("has_evidence", []() { return (int64_t)intentir_cuda_has_evidence(); }, "Whether intent.meta evidence was present at codegen time");
+"""
+    if has_contract_api:
+        selected_api += """
+  m.def("contract_level", []() { return (int64_t)intentir_cuda_contract_level(); }, "Contract level enum (0=OUT_OF_SCOPE,1=PARTIAL,2=FULL)");
+"""
+    if has_specialize_api:
+        selected_api += """
+  m.def("specialize_dims", []() { return (int64_t)intentir_cuda_specialize_dims(); }, "Whether dimensions were specialized as compile-time constants");
+"""
+    if has_fastpath_api:
+        selected_api += """
+  m.def("fastpath_enabled", []() { return (int64_t)intentir_cuda_get_fastpath_enabled(); }, "Whether a contract-gated fast path was enabled for the selected variant");
+"""
+
+    src = f"""
+#include <string>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+{cuda_src}
+
+static void launch({", ".join(sig_args)}) {{
+  {" ".join(checks)}
+  {" ".join(ptr_decls)}
+{launch_body}
+}}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+  m.def("launch", &launch, "Launch CUDA kernel");
+{selected_api.rstrip()}
+}}
+""".lstrip()
+    return src
+
+
+def _prune_stale_torch_lock(build_dir: Path) -> None:
+    lock_path = build_dir / "lock"
+    if not lock_path.is_file():
+        return
+    raw = os.getenv("INTENTIR_CUDA_RUNTIME_LOCK_STALE_SEC", "300")
+    try:
+        stale_sec = max(30, int(raw))
+    except Exception:
+        stale_sec = 300
+    try:
+        age_sec = max(0.0, float(time.time()) - float(lock_path.stat().st_mtime))
+    except Exception:
+        return
+    if age_sec < float(stale_sec):
+        return
+    try:
+        lock_path.unlink()
+    except Exception:
+        return
+
+
+def _has_built_extension_artifact(build_dir: Path, module_name: str) -> bool:
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        candidate = build_dir / f"{module_name}{suffix}"
+        if candidate.is_file():
+            return True
+    return False
+
+
+def _reset_incomplete_torch_ext_build_dir(build_dir: Path, module_name: str) -> None:
+    if not build_dir.is_dir():
+        return
+    if _has_built_extension_artifact(build_dir, module_name):
+        return
+    has_partial = any((build_dir / p).exists() for p in ("build.ninja", "main.cpp", "cuda.cu", "main.o"))
+    if not has_partial:
+        return
+    try:
+        shutil.rmtree(build_dir)
+    except Exception:
+        return
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _is_missing_extension_so_error(msg: str, module_name: str) -> bool:
+    s = str(msg).lower()
+    if "cannot open shared object file" not in s:
+        return False
+    if module_name.lower() in s:
+        return True
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        if f"{module_name}{suffix}".lower() in s:
+            return True
+    return False
+
+
+@lru_cache(maxsize=32)
+def _load_ext_cached(name: str, cuda_src: str, extra_cuda_cflags: Tuple[str, ...]) -> Any:
+    torch = _torch()
+
+    # Avoid compiling fatbins for unrelated GPU architectures by default.
+    # This speeds up iteration (and prevents confusing "hangs" during nvcc builds)
+    # while still allowing users to override explicitly via env var.
+    if not os.getenv("TORCH_CUDA_ARCH_LIST"):
+        try:
+            major, minor = torch.cuda.get_device_capability()
+            os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+        except Exception:
+            pass
+
+    _maybe_set_cuda_home_for_hopper()
+
+    # Import after `_maybe_set_cuda_home_for_hopper()` so torch's CUDA_HOME detection
+    # (evaluated at module import time) can see the updated environment.
+    _maybe_add_python_ninja_to_path()
+    from torch.utils.cpp_extension import is_ninja_available, load_inline  # noqa: PLC0415
+
+    build_dir = _torch_ext_build_dir(name)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    _prune_stale_torch_lock(build_dir)
+    _reset_incomplete_torch_ext_build_dir(build_dir, name)
+    # Torch uses Ninja by default; some remote machines (e.g. SSH-only clusters)
+    # may not have it installed. Fall back to the distutils builder if needed.
+    if os.getenv("USE_NINJA") is None and (shutil.which("ninja") is None or not is_ninja_available()):
+        os.environ["USE_NINJA"] = "0"
+
+    def _do_load() -> Any:
+        return load_inline(
+            name=name,
+            cpp_sources="",
+            cuda_sources=cuda_src,
+            functions=None,
+            with_cuda=True,
+            extra_cuda_cflags=["--std=c++17", *list(extra_cuda_cflags)],
+            extra_cflags=["-std=c++17", "-O3"],
+            extra_include_paths=_intentir_cuda_include_dirs(),
+            build_directory=str(build_dir),
+            verbose=False,
+        )
+
+    try:
+        return _do_load()
+    except ImportError as e:
+        msg = str(e)
+        if _is_missing_extension_so_error(msg, name):
+            _reset_incomplete_torch_ext_build_dir(build_dir, name)
+            return _do_load()
+        raise
+    except RuntimeError as e:
+        msg = str(e)
+        if ("Ninja is required" in msg or "ninja" in msg.lower()) and os.getenv("USE_NINJA") != "0":
+            os.environ["USE_NINJA"] = "0"
+            return _do_load()
+        if _is_missing_extension_so_error(msg, name):
+            _reset_incomplete_torch_ext_build_dir(build_dir, name)
+            return _do_load()
+        raise
+
+
+@lru_cache(maxsize=32)
+def _load_nvrtc_cached(
+    name: str,
+    kernel_name: str,
+    cuda_src: str,
+    io_spec_json: str,
+    extra_cuda_cflags: Tuple[str, ...],
+) -> Any:
+    import json  # noqa: PLC0415
+
+    io_spec = json.loads(io_spec_json)
+    return _NvrtcCudaModule(kernel_name=kernel_name, cuda_src=cuda_src, io_spec=io_spec, extra_cuda_cflags=extra_cuda_cflags)
+
+
+def cuda_extension_cache_info(
+    *,
+    kernel_name: str,
+    cuda_src: str,
+    extra_cuda_cflags: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Return deterministic module identity and whether a built artifact already exists.
+
+    This is used for observability in backend smoke runs so we can distinguish
+    cold compile costs from warm-cache launches.
+    """
+    flags = _normalize_cuda_compile_flags(extra_cuda_cflags)
+    h = _hash_src(
+        cuda_src
+        + "\nRUNTIME_HEADERS:"
+        + _intentir_cuda_runtime_hash_payload()
+        + "\nRUNNER_PY:"
+        + _intentir_cuda_runner_hash_payload()
+        + "\nFLAGS:"
+        + " ".join(flags)
+    )
+    mod_name = f"intentir_cuda_{kernel_name}_{h}"
+    build_dir = _torch_ext_build_dir(mod_name)
+    return {
+        "module_name": str(mod_name),
+        "build_dir": str(build_dir),
+        "artifact_exists": bool(_has_built_extension_artifact(build_dir, mod_name)),
+        "flags": list(flags),
+    }
+
+
+def compile_cuda_extension(
+    *,
+    kernel_name: str,
+    cuda_src: str,
+    io_spec: Dict[str, Any],
+    extra_cuda_cflags: Optional[Iterable[str]] = None,
+) -> Any:
+    """
+    Compile (or load from cache) a tiny Torch extension that exposes `launch(...)`.
+    """
+    # Default to optimized builds. Torch's extension build defaults can vary across
+    # environments; being explicit avoids accidental -O0 device code in benchmarks.
+    cache_info = cuda_extension_cache_info(
+        kernel_name=kernel_name,
+        cuda_src=cuda_src,
+        extra_cuda_cflags=extra_cuda_cflags,
+    )
+    flags: tuple[str, ...] = tuple(str(x) for x in list(cache_info.get("flags") or []))
+    mod_name = str(cache_info.get("module_name") or "")
+    force_nvrtc_raw = os.getenv("INTENTIR_CUDA_FORCE_NVRTC", "0").strip().lower()
+    force_nvrtc = force_nvrtc_raw in {"1", "true", "yes", "y"}
+    if force_nvrtc:
+        import json  # noqa: PLC0415
+
+        return _load_nvrtc_cached(mod_name, kernel_name, cuda_src, json.dumps(io_spec, sort_keys=True), flags)
+
+    full_src = _build_extension_src(cuda_src, kernel_name=kernel_name, io_spec=io_spec)
+    try:
+        return _load_ext_cached(mod_name, full_src, flags)
+    except Exception as e:
+        # NVRTC fallback: driver-only machines may have CUDA-capable torch wheels but no toolkit/nvcc.
+        raw = os.getenv("INTENTIR_CUDA_NVRTC_FALLBACK", "1").strip().lower()
+        allow_nvrtc = raw in {"1", "true", "yes", "y"}
+        msg = str(e)
+        if not allow_nvrtc:
+            raise
+        # If nvcc is unavailable, always try NVRTC fallback.
+        if not _has_working_nvcc():
+            import json  # noqa: PLC0415
+
+            return _load_nvrtc_cached(mod_name, kernel_name, cuda_src, json.dumps(io_spec, sort_keys=True), flags)
+        # Even when nvcc exists, allow fallback for common extension-toolchain issues.
+        lower_msg = msg.lower()
+        missing_so = _is_missing_extension_so_error(msg, mod_name)
+        if ("cuda_home" not in lower_msg) and ("nvcc" not in lower_msg) and ("ninja" not in lower_msg) and (not missing_so):
+            raise
+        import json  # noqa: PLC0415
+
+        return _load_nvrtc_cached(mod_name, kernel_name, cuda_src, json.dumps(io_spec, sort_keys=True), flags)
+
+
+def compile_cuda_src_to_ptx(
+    *,
+    kernel_name: str,
+    cuda_src: str,
+    extra_cuda_cflags: Optional[Iterable[str]] = None,
+    include_dirs: Optional[Iterable[str | Path]] = None,
+) -> bytes:
+    """
+    Compile CUDA source to PTX bytes via NVRTC.
+    """
+    flags = _normalize_cuda_compile_flags(extra_cuda_cflags)
+    return _nvrtc_compile_ptx(
+        cuda_src=cuda_src,
+        prog_name=f"{kernel_name}.cu",
+        extra_cuda_cflags=flags,
+        extra_include_dirs=include_dirs,
+    )
+
+
+def load_cuda_ptx_module(
+    *,
+    kernel_name: str,
+    ptx: bytes | str,
+    io_spec: Dict[str, Any],
+) -> Any:
+    """
+    Load a prebuilt PTX module and return an object exposing `launch(...)`.
+    """
+    return _NvrtcCudaModule(
+        kernel_name=kernel_name,
+        cuda_src="",
+        io_spec=io_spec,
+        extra_cuda_cflags=(),
+        ptx=ptx,
+        selected_tag="ptx_prebuilt",
+    )
+
+
+def run_cuda_kernel_io_ptx(
+    *,
+    kernel_name: str,
+    ptx: bytes | str,
+    io_spec: Dict[str, Any],
+    launch: CudaLaunch,
+    bindings: Dict[str, Any],
+    inputs_np: Dict[str, np.ndarray],
+    output_names: Iterable[str],
+    device: str = "cuda",
+    compiled_module: Any = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Execute a CUDA kernel from prebuilt PTX, returning a numpy IO dict.
+    """
+    mod = compiled_module if compiled_module is not None else load_cuda_ptx_module(
+        kernel_name=kernel_name,
+        ptx=ptx,
+        io_spec=io_spec,
+    )
+    return run_cuda_kernel_io(
+        kernel_name=kernel_name,
+        cuda_src="",
+        io_spec=io_spec,
+        launch=launch,
+        bindings=bindings,
+        inputs_np=inputs_np,
+        output_names=output_names,
+        device=device,
+        compiled_module=mod,
+    )
+
+
+def _tensor_to_numpy(tensor: Any) -> np.ndarray:
+    torch = _torch()
+    host = tensor.detach().cpu()
+    try:
+        return host.numpy()
+    except TypeError:
+        if host.dtype == torch.bfloat16:
+            return host.to(dtype=torch.float32).numpy()
+        raise
+
+
+def run_cuda_kernel_io(
+    *,
+    kernel_name: str,
+    cuda_src: str,
+    io_spec: Dict[str, Any],
+    launch: CudaLaunch,
+    bindings: Dict[str, Any],
+    inputs_np: Dict[str, np.ndarray],
+    output_names: Iterable[str],
+    device: str = "cuda",
+    extra_cuda_cflags: Optional[Iterable[str]] = None,
+    compiled_module: Any = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Execute a CUDA kernel, returning a numpy IO dict (inputs + outputs).
+    """
+    torch = _torch()
+    if not torch.cuda.is_available():
+        raise CudaRuntimeError("torch.cuda is not available; cannot run CUDA baseline")
+
+    min_free = _min_free_mem_mb()
+    if min_free > 0:
+        free_mb = _cuda_free_mem_mb()
+        if free_mb < min_free:
+            raise CudaRuntimeError(
+                f"CUDA free memory too low ({free_mb} MiB < {min_free} MiB). "
+                "Free GPU memory (stop GPU-heavy processes) or set INTENTIR_CUDA_MIN_FREE_MB=0 to bypass."
+            )
+
+    tensors = io_spec.get("tensors") if isinstance(io_spec.get("tensors"), dict) else {}
+    scalars = io_spec.get("scalars") if isinstance(io_spec.get("scalars"), dict) else {}
+    output_init = io_spec.get("output_init") if isinstance(io_spec.get("output_init"), dict) else {}
+    arg_names = io_spec.get("arg_names") if isinstance(io_spec.get("arg_names"), list) else []
+    arg_names = [str(x) for x in arg_names]
+    out_set = {str(x) for x in output_names}
+    bindings = _augment_scalar_bindings_from_io_spec(bindings=bindings, io_spec=io_spec)
+
+    def _tensor_alias_base(name: str) -> str:
+        n = str(name).strip()
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)__", n)
+        if m is not None:
+            base = str(m.group(1))
+            if base in tensors:
+                return base
+        return n
+
+    def _tensor_descriptor_suffix(name: str, base_name: str) -> str:
+        raw = str(name).strip()
+        prefix = f"{base_name}__"
+        return raw[len(prefix) :] if raw.startswith(prefix) else ""
+
+    def _tensor_slot_count(base_name: str, kind: str) -> int:
+        prefix = f"{base_name}__{kind}"
+        return sum(1 for x in arg_names if str(x).startswith(prefix))
+
+    def _resolve_tensor_arg(base_name: str, spec: Mapping[str, Any]) -> Any:
+        dt = str(spec.get("dtype") or "f32")
+        shape_tpl = spec.get("shape") if isinstance(spec.get("shape"), list) else None
+        if base_name in outputs_torch:
+            return outputs_torch[base_name]
+        if base_name in inputs_torch:
+            return inputs_torch[base_name]
+        if base_name in out_set:
+            if shape_tpl is None:
+                raise CudaRuntimeError(f"missing output tensor shape for {base_name} in io_spec")
+            shape = tuple(int(bindings[str(d)]) if isinstance(d, str) else int(d) for d in shape_tpl)
+            init_spec = output_init.get(base_name)
+            if isinstance(init_spec, dict) and str(init_spec.get("op") or "").strip().lower() == "fill" and "value" in init_spec:
+                t = torch.full(shape, float(init_spec.get("value") or 0.0), device=device, dtype=_dtype_to_torch(dt))
+            elif isinstance(init_spec, (int, float)):
+                t = torch.full(shape, float(init_spec), device=device, dtype=_dtype_to_torch(dt))
+            else:
+                t = torch.empty(shape, device=device, dtype=_dtype_to_torch(dt))
+            outputs_torch[base_name] = t
+            return t
+        if base_name in inputs_np:
+            arr = np.asarray(inputs_np[base_name])
+            t = torch.from_numpy(arr).to(device=device)
+            if t.dtype != _dtype_to_torch(dt):
+                t = t.to(dtype=_dtype_to_torch(dt))
+            t = t.contiguous()
+            inputs_torch[base_name] = t
+            return t
+        if shape_tpl == [] and (base_name in bindings):
+            val = bindings[base_name]
+            if dt == "f32":
+                return torch.tensor(float(val), device=device, dtype=torch.float32)
+            return torch.tensor(int(val), device=device, dtype=_dtype_to_torch(dt))
+        raise CudaRuntimeError(f"missing input {base_name} for CUDA baseline; have keys={sorted(inputs_np.keys())}")
+
+    def _resolve_tensor_descriptor_arg(name: str, base_name: str, tensor: Any) -> Any:
+        suffix = _tensor_descriptor_suffix(name, base_name)
+        if suffix == "aligned":
+            return tensor
+        if suffix == "offset":
+            return int(bindings.get(name, 0))
+        if suffix.startswith("size"):
+            idx = int(suffix[len("size") :])
+            if name in bindings:
+                return int(bindings[name])
+            if _tensor_slot_count(base_name, "size") == 1:
+                return int(tensor.numel()) if int(tensor.dim()) > 0 else 1
+            dims = list(tensor.shape)
+            if 0 <= idx < len(dims):
+                return int(dims[idx])
+            if not dims and idx == 0:
+                return 1
+            raise CudaRuntimeError(f"cannot resolve tensor descriptor arg {name}")
+        if suffix.startswith("stride"):
+            idx = int(suffix[len("stride") :])
+            if name in bindings:
+                return int(bindings[name])
+            if _tensor_slot_count(base_name, "stride") == 1:
+                return 1
+            strides = list(tensor.stride())
+            if 0 <= idx < len(strides):
+                return int(strides[idx])
+            if not strides and idx == 0:
+                return 1
+            raise CudaRuntimeError(f"cannot resolve tensor descriptor arg {name}")
+        raise CudaRuntimeError(f"unsupported tensor descriptor arg {name}")
+
+    # Build torch args in kernel param order.
+    args: list[Any] = []
+    outputs_torch: Dict[str, Any] = {}
+    inputs_torch: Dict[str, Any] = {}
+    try:
+        for name in arg_names:
+            if name in tensors:
+                spec = tensors[name] if isinstance(tensors.get(name), dict) else {}
+                base_name = _tensor_alias_base(name)
+                tensor = _resolve_tensor_arg(base_name, spec)
+                if base_name in out_set:
+                    outputs_torch[base_name] = tensor
+                args.append(tensor)
+            elif _tensor_alias_base(name) in tensors:
+                base_name = _tensor_alias_base(name)
+                spec = tensors[base_name] if isinstance(tensors.get(base_name), dict) else {}
+                tensor = _resolve_tensor_arg(base_name, spec)
+                args.append(_resolve_tensor_descriptor_arg(name, base_name, tensor))
+            elif name in scalars:
+                if name not in bindings:
+                    raise CudaRuntimeError(f"missing scalar binding {name}; have {sorted(bindings.keys())}")
+                dt = str(scalars[name])
+                if dt == "f32":
+                    args.append(float(bindings[name]))
+                else:
+                    args.append(int(bindings[name]))
+            else:
+                if name not in bindings:
+                    raise CudaRuntimeError(f"missing binding for unknown arg {name}")
+                args.append(int(bindings[name]))
+    except RuntimeError as e:
+        msg = str(e)
+        if "out of memory" in msg.lower():
+            free_mb = _cuda_free_mem_mb()
+            raise CudaRuntimeError(f"CUDA OOM during input/output allocation (free≈{free_mb} MiB): {msg}") from e
+        raise
+
+    # Append launch dims
+    gx, gy, gz = (int(x) for x in launch.grid)
+    bx, by, bz = (int(x) for x in launch.block)
+    args += [gx, gy, gz, bx, by, bz, int(launch.shared_mem)]
+
+    mod = (
+        compiled_module
+        if compiled_module is not None
+        else compile_cuda_extension(
+            kernel_name=kernel_name,
+            cuda_src=cuda_src,
+            io_spec=io_spec,
+            extra_cuda_cflags=extra_cuda_cflags,
+        )
+    )
+    try:
+        mod.launch(*args)
+        torch.cuda.synchronize()
+    except Exception as e:
+        raise CudaRuntimeError(f"CUDA kernel launch failed: {type(e).__name__}: {e}") from e
+
+    out: Dict[str, np.ndarray] = {k: np.asarray(v) for k, v in inputs_np.items()}
+    for name, t in outputs_torch.items():
+        out[name] = _tensor_to_numpy(t)
+    return out
+
+
+__all__ = [
+    "CudaLaunch",
+    "CudaRuntimeError",
+    "compile_cuda_extension",
+    "compile_cuda_src_to_ptx",
+    "cuda_extension_cache_info",
+    "load_cuda_ptx_module",
+    "run_cuda_kernel_io",
+    "run_cuda_kernel_io_ptx",
+]
