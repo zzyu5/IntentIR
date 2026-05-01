@@ -1,5 +1,7 @@
 # IntentIR
 
+**Language:** [English](README.md) | [中文](README.zh-CN.md)
+
 IntentIR is a TianChen Stack subproject for turning optimized ML kernels into
 auditable, portable operator assets.
 
